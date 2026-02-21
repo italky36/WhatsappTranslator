@@ -1,0 +1,87 @@
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         String   @default("user") // admin | user
+  status       String   @default("active") // active | blocked
+  createdAt    DateTime @default(now()) @map("created_at")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  limits          UserLimit?
+  refreshSessions RefreshSession[]
+  usageMonthly    UsageMonthly[]
+  auditLogs       AuditLog[]       @relation("AuditActor")
+  targetedLogs    AuditLog[]       @relation("AuditTarget")
+
+  @@map("users")
+}
+
+model UserLimit {
+  id              String   @id @default(uuid())
+  userId          String   @unique @map("user_id")
+  isUnlimited     Boolean  @default(false) @map("is_unlimited")
+  monthlyLimitChars Int    @default(500000) @map("monthly_limit_chars")
+  dailyLimitChars Int      @default(50000) @map("daily_limit_chars")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_limits")
+}
+
+model UsageMonthly {
+  id        String @id @default(uuid())
+  userId    String @map("user_id")
+  month     String // YYYY-MM
+  charsUsed Int    @default(0) @map("chars_used")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, month])
+  @@map("usage_monthly")
+}
+
+model RefreshSession {
+  id               String    @id @default(uuid())
+  userId           String    @map("user_id")
+  refreshTokenHash String    @map("refresh_token_hash")
+  expiresAt        DateTime  @map("expires_at")
+  revokedAt        DateTime? @map("revoked_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("refresh_sessions")
+}
+
+model AppSetting {
+  key            String   @id
+  valueEncrypted String   @map("value_encrypted")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("app_settings")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  actorUserId  String?  @map("actor_user_id")
+  action       String
+  targetUserId String?  @map("target_user_id")
+  meta         String?  // JSON string
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  actor  User? @relation("AuditActor", fields: [actorUserId], references: [id])
+  target User? @relation("AuditTarget", fields: [targetUserId], references: [id])
+
+  @@map("audit_log")
+}

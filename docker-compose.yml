@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=file:/app/data/dev.db
+      - REDIS_URL=redis://redis:6379
+      - PORT=3000
+      - HOST=0.0.0.0
+    volumes:
+      - ./data:/app/data
+      - ./backend/.env:/app/.env
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

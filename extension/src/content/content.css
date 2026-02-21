@@ -1,0 +1,348 @@
+/* WhatsApp Translator - Content Styles */
+
+.wt-translation {
+  font-size: 12px;
+  color: #667781;
+  margin-top: 4px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 4px;
+  border-left: 2px solid #25D366;
+}
+
+.wt-translation.style-small {
+  font-size: 11px;
+  padding: 2px 6px;
+  opacity: 0.8;
+}
+
+.wt-translation.style-compact {
+  font-size: 12px;
+  padding: 2px 4px;
+  background: transparent;
+  border-left: none;
+  color: #8696a0;
+}
+
+.wt-translation.style-compact::before {
+  content: '→ ';
+  opacity: 0.6;
+}
+
+.wt-translation.incoming {
+  border-left-color: #25D366;
+}
+
+.wt-translation.outgoing {
+  border-left-color: #00a884;
+}
+
+.wt-translate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #25D366;
+  color: white;
+  border: none;
+  cursor: pointer;
+  margin-left: 8px;
+  transition: background 0.2s;
+}
+
+.wt-translate-btn:hover {
+  background: #128C7E;
+}
+
+.wt-translate-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.wt-translate-btn.loading {
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+.wt-translate-btn.loading svg {
+  animation: wt-spin 1s linear infinite;
+}
+
+@keyframes wt-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Translating overlay on input area */
+.wt-translating-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 8px;
+  z-index: 10;
+  pointer-events: none;
+  animation: wt-fade-in 0.15s ease;
+}
+
+.wt-translating-dots {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.wt-translating-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #25D366;
+  animation: wt-dot-bounce 1.2s ease-in-out infinite;
+}
+
+.wt-translating-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.wt-translating-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes wt-dot-bounce {
+  0%, 60%, 100% { opacity: 0.3; transform: scale(0.8); }
+  30% { opacity: 1; transform: scale(1.2); }
+}
+
+@keyframes wt-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.wt-translating-label {
+  font-size: 13px;
+  color: #25D366;
+  font-weight: 500;
+}
+
+.wt-original-dimmed {
+  opacity: 0.55;
+  font-size: 0.92em;
+}
+
+.wt-error {
+  color: #e53e3e;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+/* Input area button container */
+.wt-input-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 8px;
+}
+
+/* ===== Floating Widget (FAB) ===== */
+
+.wt-fab-container {
+  position: fixed;
+  right: 18px;
+  bottom: 80px;
+  z-index: 9999;
+}
+
+.wt-fab {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: #25D366;
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
+  transition: background 0.25s, transform 0.2s, box-shadow 0.2s;
+}
+
+.wt-fab:hover {
+  transform: scale(1.08);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.wt-fab.inactive {
+  background: #8696a0;
+}
+
+.wt-fab svg {
+  width: 24px;
+  height: 24px;
+  fill: currentColor;
+}
+
+/* Close button (small X on top-right of FAB) */
+.wt-fab-close {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #e53e3e;
+  color: #fff;
+  border: 2px solid #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.15s, transform 0.15s;
+  z-index: 1;
+}
+
+.wt-fab-close svg {
+  width: 10px;
+  height: 10px;
+  fill: currentColor;
+}
+
+.wt-fab-container:hover .wt-fab-close {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.wt-fab-close:hover {
+  background: #c53030;
+}
+
+/* FAB menu panel */
+.wt-fab-menu {
+  position: fixed;
+  right: 18px;
+  bottom: 138px;
+  width: 220px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18);
+  z-index: 9999;
+  padding: 12px 0;
+  opacity: 0;
+  transform: translateY(10px);
+  pointer-events: none;
+  transition: opacity 0.2s, transform 0.2s;
+}
+
+.wt-fab-menu.open {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.wt-fab-menu-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: #111b21;
+  padding: 0 14px 8px;
+  border-bottom: 1px solid #e9edef;
+  margin-bottom: 4px;
+}
+
+.wt-fab-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+.wt-fab-toggle:hover {
+  background: #f0f2f5;
+}
+
+.wt-fab-toggle span {
+  font-size: 13px;
+  color: #3b4a54;
+  user-select: none;
+}
+
+.wt-fab-divider {
+  height: 1px;
+  background: #e9edef;
+  margin: 2px 14px;
+}
+
+.wt-fab-langs {
+  padding: 6px 14px 2px;
+  border-top: 1px solid #e9edef;
+  margin-top: 4px;
+}
+
+.wt-fab-lang-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 2px 0;
+}
+
+.wt-fab-lang-label {
+  font-size: 11px;
+  color: #8696a0;
+}
+
+.wt-fab-lang-value {
+  font-size: 11px;
+  color: #3b4a54;
+  font-weight: 500;
+}
+
+/* Toggle switch */
+.wt-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.wt-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.wt-slider {
+  position: absolute;
+  inset: 0;
+  background: #ccc;
+  border-radius: 20px;
+  transition: background 0.2s;
+  cursor: pointer;
+}
+
+.wt-slider::before {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  bottom: 2px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.wt-switch input:checked + .wt-slider {
+  background: #25D366;
+}
+
+.wt-switch input:checked + .wt-slider::before {
+  transform: translateX(16px);
+}
