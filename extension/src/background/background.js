@@ -107,6 +107,9 @@ async function handleMessage(message, sender) {
     case 'UI_LANGUAGE_CHANGED':
       return handleUiLanguageChanged(message.lang);
 
+    case 'TRANSLATE_BATCH':
+      return handleTranslateBatch(message.data);
+
     default:
       return { error: 'Unknown message type' };
   }
@@ -230,6 +233,25 @@ async function getUsage() {
     return await response.json();
   }
   return null;
+}
+
+async function handleTranslateBatch({ segments, source, target }) {
+  try {
+    const response = await apiCall('/translate/batch', {
+      method: 'POST',
+      body: JSON.stringify({ segments, source: source || 'auto', target }),
+    });
+
+    const data = await response.json();
+
+    if (response.ok) {
+      return { success: true, ...data };
+    } else {
+      return { success: false, error: data.error };
+    }
+  } catch (error) {
+    return { success: false, error: 'Batch translation failed' };
+  }
 }
 
 async function getLanguages() {

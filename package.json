@@ -1,0 +1,33 @@
+{
+  "name": "whatsapp-translator",
+  "version": "1.0.0",
+  "description": "Корпоративный инструмент для перевода сообщений в WhatsApp Web с использованием DeepL API.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/italky36/WhatsappTranslator.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/italky36/WhatsappTranslator/issues"
+  },
+  "homepage": "https://github.com/italky36/WhatsappTranslator#readme",
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "mammoth": "^1.11.0",
+    "pdfjs-dist": "^3.11.174",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "exceljs": "^4.4.0"
+  }
+}

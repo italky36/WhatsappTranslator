@@ -51,7 +51,6 @@
     isAuthenticated = status.authenticated;
     
     if (!isAuthenticated) {
-      console.log('WhatsApp Translator: Not authenticated');
       return;
     }
     
@@ -72,7 +71,6 @@
     // Optional: keep translate button (uses same send flow)
     injectTranslateButton();
 
-    console.log('WhatsApp Translator: Initialized');
   }
 
   // Communication with background

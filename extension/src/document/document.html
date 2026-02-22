@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Document Translation</title>
+  <link rel="stylesheet" href="document.css">
+</head>
+<body>
+  <div class="header">
+    <h1 data-i18n="docPageTitle">Document Translation</h1>
+    <div class="lang-switcher">
+      <button class="lang-btn active" data-lang="en">EN</button>
+      <button class="lang-btn" data-lang="ru">RU</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <!-- Loading -->
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <p data-i18n="loading">Loading...</p>
+    </div>
+
+    <!-- Auth Required -->
+    <div id="auth-required" class="auth-required" style="display:none">
+      <div class="auth-icon">&#128274;</div>
+      <h2 data-i18n="authRequired">Authorization Required</h2>
+      <p data-i18n="authMessage">Please log in through the extension popup to use document translation.</p>
+      <div class="auth-instructions">
+        <p data-i18n="authStep1">1. Click the WhatsApp Translator extension icon in the toolbar</p>
+        <p data-i18n="authStep2">2. Enter your email and password</p>
+        <p data-i18n="authStep3">3. Return to this page and refresh</p>
+      </div>
+    </div>
+
+    <!-- Main Content -->
+    <div id="main-content" style="display:none">
+      <div id="view-upload" class="view active">
+        <!-- Language Selectors -->
+        <div class="language-bar">
+          <div class="lang-select-group">
+            <label data-i18n="docSourceLang">From language</label>
+            <select id="source-lang">
+              <option value="auto" data-i18n="docAutoDetect">Auto Detect</option>
+            </select>
+          </div>
+          <button id="swap-langs-btn" class="swap-btn" title="Swap languages" data-i18n-title="docSwapLangs">&#8644;</button>
+          <div class="lang-select-group">
+            <label data-i18n="docTargetLang">To language</label>
+            <select id="target-lang"></select>
+          </div>
+        </div>
+
+        <!-- Drop Zone -->
+        <div id="drop-zone" class="drop-zone">
+          <div class="drop-zone-content">
+            <div class="drop-zone-icon">&#128196;</div>
+            <p class="drop-zone-title" data-i18n="docDropZoneTitle">Drop files here</p>
+            <p class="drop-zone-or" data-i18n="docDropZoneOr">or</p>
+            <button class="btn btn-primary" id="select-files-btn" data-i18n="docDropZoneBtn">Select files</button>
+            <p class="drop-zone-formats" data-i18n="docDropZoneFormats">Supported formats: .xlsx, .docx, .pdf</p>
+          </div>
+          <input type="file" id="file-input" multiple accept=".xlsx,.xls,.docx,.pdf" style="display:none">
+        </div>
+
+        <!-- File List -->
+        <div id="file-list" class="file-list"></div>
+
+        <!-- Translate Button -->
+        <div id="translate-section" class="translate-section" style="display:none">
+          <div id="translation-progress" class="translation-progress" style="display:none">
+            <div class="translation-progress-header">
+              <span id="overall-progress-text" data-i18n="docOverallProgress">Translation: 0 of 0 files</span>
+              <span id="overall-progress-percent">0%</span>
+            </div>
+            <div class="progress-track progress-track-overall">
+              <div id="overall-progress-fill" class="progress-fill"></div>
+            </div>
+          </div>
+          <button id="translate-btn" class="btn btn-primary btn-translate" disabled>
+            <span data-i18n="docTranslateBtn">Translate</span>
+          </button>
+          <button id="cancel-translation-btn" class="btn btn-secondary btn-cancel-translation" style="display:none" data-i18n="docCancel">Cancel</button>
+        </div>
+      </div>
+
+      <div id="view-results" class="view">
+        <div class="results-header">
+          <div id="results-summary" class="results-summary"></div>
+          <div class="results-actions">
+            <button id="download-all-btn" class="btn btn-primary btn-small" data-i18n="docDownloadAll">Download all</button>
+            <button id="new-translation-btn" class="btn btn-secondary btn-small" data-i18n="docNewTranslation">New translation</button>
+          </div>
+        </div>
+        <div id="results-grid" class="results-grid"></div>
+      </div>
+
+      <div id="view-preview" class="view">
+        <div class="preview-shell">
+          <div class="preview-header">
+            <button id="preview-back-btn" class="btn btn-secondary btn-small" data-i18n="docBack">Back</button>
+            <div id="preview-title" class="preview-title"></div>
+            <button id="preview-download-btn" class="btn btn-primary btn-small" data-i18n="docDownload">Download</button>
+          </div>
+          <div id="preview-content" class="preview-content"></div>
+        </div>
+      </div>
+
+      <!-- Limit Warning Modal -->
+      <div id="limit-modal" class="modal-overlay" style="display:none">
+        <div class="modal">
+          <p class="modal-warning">&#9888;&#65039; <span data-i18n="docLimitWarning">Translation may exceed your character limit.</span></p>
+          <p class="modal-details" id="limit-details"></p>
+          <div class="modal-buttons">
+            <button class="btn btn-primary" id="limit-continue" data-i18n="docContinue">Continue anyway</button>
+            <button class="btn btn-secondary" id="limit-cancel" data-i18n="docCancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Libraries -->
+  <script src="../../libs/jszip.min.js"></script>
+  <script src="../../libs/xlsx.full.min.js"></script>
+  <script src="../../libs/exceljs.min.js"></script>
+  <script src="../../libs/mammoth.browser.min.js"></script>
+  <script src="../../libs/pdf.min.js"></script>
+
+  <!-- Parsers -->
+  <script src="parsers/excel-parser.js"></script>
+  <script src="parsers/word-parser.js"></script>
+  <script src="parsers/pdf-parser.js"></script>
+  <script src="parsers/index.js"></script>
+  <script src="translation-manager.js"></script>
+  <script src="download-manager.js"></script>
+
+  <script src="document.js"></script>
+</body>
+</html>

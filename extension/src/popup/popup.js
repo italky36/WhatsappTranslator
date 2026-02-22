@@ -26,6 +26,7 @@ const i18n = {
     optionsTitle: 'Options',
     skipSame: 'Skip if same language',
     minLength: 'Min message length (chars)',
+    docTranslate: 'Document Translation',
     saveBtn: 'Save Settings',
     saved: 'Saved!',
     usageUnlimited: '{used} chars used (Unlimited)',
@@ -55,6 +56,7 @@ const i18n = {
     optionsTitle: 'Настройки',
     skipSame: 'Пропускать одинаковый язык',
     minLength: 'Мин. длина сообщения (символов)',
+    docTranslate: 'Перевод документов',
     saveBtn: 'Сохранить настройки',
     saved: 'Сохранено!',
     usageUnlimited: '{used} символов использовано (Безлимит)',
@@ -251,6 +253,11 @@ document.getElementById('show-widget').addEventListener('change', async (e) => {
   const current = await sendMessage({ type: 'GET_SETTINGS' });
   current.showFloatingWidget = e.target.checked;
   await sendMessage({ type: 'SAVE_SETTINGS', data: current });
+});
+
+// Open document translation page
+document.getElementById('doc-translate-btn').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('src/document/document.html') });
 });
 
 // Save settings
