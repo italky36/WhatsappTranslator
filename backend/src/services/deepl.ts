@@ -103,6 +103,110 @@ export async function translateText(
   };
 }
 
+interface TranslateBatchResult {
+  translations: Array<{ translatedText: string; detectedSourceLang: string }>;
+  totalCharCount: number;
+}
+
+const DEEPL_BATCH_LIMIT = 50;
+
+export async function translateBatch(
+  texts: string[],
+  targetLang: string,
+  sourceLang?: string
+): Promise<TranslateBatchResult> {
+  const config = await getDeepLConfig();
+
+  if (!config) {
+    throw new Error('PROVIDER_NOT_CONFIGURED');
+  }
+
+  const url = `${config.endpoint}/v2/translate`;
+
+  // Filter out empty strings, keeping track of their positions
+  const indexedTexts = texts.map((text, i) => ({ text, originalIndex: i }));
+  const nonEmpty = indexedTexts.filter(t => t.text.length > 0);
+  const emptyIndices = new Set(indexedTexts.filter(t => t.text.length === 0).map(t => t.originalIndex));
+
+  if (nonEmpty.length === 0) {
+    return {
+      translations: texts.map(() => ({ translatedText: '', detectedSourceLang: '' })),
+      totalCharCount: 0,
+    };
+  }
+
+  // Split into chunks of DEEPL_BATCH_LIMIT
+  const chunks: Array<typeof nonEmpty> = [];
+  for (let i = 0; i < nonEmpty.length; i += DEEPL_BATCH_LIMIT) {
+    chunks.push(nonEmpty.slice(i, i + DEEPL_BATCH_LIMIT));
+  }
+
+  const allTranslations: Array<{ translatedText: string; detectedSourceLang: string; originalIndex: number }> = [];
+  let totalCharCount = 0;
+
+  for (const chunk of chunks) {
+    const body: Record<string, string | string[]> = {
+      text: chunk.map(t => t.text),
+      target_lang: targetLang.toUpperCase(),
+    };
+
+    if (sourceLang && sourceLang.toLowerCase() !== 'auto') {
+      body.source_lang = sourceLang.toUpperCase();
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `DeepL-Auth-Key ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('DeepL API error:', response.status, errorText);
+
+      if (response.status === 403) {
+        throw new Error('INVALID_API_KEY');
+      }
+      if (response.status === 456) {
+        throw new Error('QUOTA_EXCEEDED');
+      }
+      throw new Error('TRANSLATION_FAILED');
+    }
+
+    const data = await response.json() as DeepLResponse;
+
+    for (let i = 0; i < data.translations.length; i++) {
+      const t = data.translations[i];
+      allTranslations.push({
+        translatedText: t.text,
+        detectedSourceLang: t.detected_source_language,
+        originalIndex: chunk[i].originalIndex,
+      });
+      totalCharCount += chunk[i].text.length;
+    }
+  }
+
+  // Rebuild result array in original order
+  const result: Array<{ translatedText: string; detectedSourceLang: string }> = new Array(texts.length);
+
+  for (const t of allTranslations) {
+    result[t.originalIndex] = {
+      translatedText: t.translatedText,
+      detectedSourceLang: t.detectedSourceLang,
+    };
+  }
+
+  // Fill empty positions
+  for (const idx of emptyIndices) {
+    result[idx] = { translatedText: '', detectedSourceLang: '' };
+  }
+
+  return { translations: result, totalCharCount };
+}
+
 export async function testApiKey(apiKey: string, endpoint: string): Promise<{ valid: boolean; usage?: DeepLUsage; error?: string }> {
   try {
     const response = await fetch(`${endpoint}/v2/usage`, {
