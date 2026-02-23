@@ -265,6 +265,13 @@
 
       if (isOutgoingMessage(row)) return;
 
+      // Skip messages that match a recently sent translation (race condition guard)
+      if (lastSentTranslation && Date.now() - lastSentTranslation.timestamp < 6000 &&
+          text === lastSentTranslation.translated) {
+        row.dataset.extTranslated = '1';
+        return;
+      }
+
       const chatId = getCurrentChatId();
       const messageId = row.getAttribute('data-id') || '';
       const msgKey = generateMessageKey(chatId, 'incoming', text, messageId);

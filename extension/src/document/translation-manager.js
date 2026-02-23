@@ -330,7 +330,9 @@
       }
 
       if (typeof rawError === 'string') {
-        const code = /network|failed|connection/i.test(rawError) ? 'NETWORK_ERROR' : 'TRANSLATION_FAILED';
+        const code = /network|failed to fetch|connection|timeout|econn|enotfound/i.test(rawError)
+          ? 'NETWORK_ERROR'
+          : 'TRANSLATION_FAILED';
         return new TranslationError(code, rawError);
       }
 
@@ -345,7 +347,10 @@
       }
 
       const message = error?.message || String(error || 'Unknown error');
-      return new TranslationError('NETWORK_ERROR', message);
+      const code = /network|failed to fetch|connection|timeout|econn|enotfound/i.test(message)
+        ? 'NETWORK_ERROR'
+        : 'TRANSLATION_FAILED';
+      return new TranslationError(code, message);
     }
 
     _getRetryDelayMs(code, attempt) {
@@ -428,7 +433,7 @@
     const lowerExt = extension.toLowerCase();
 
     if (lowerExt === '.pdf') {
-      return `${name}_translated.docx`;
+      return `${name}_translated.pdf`;
     }
 
     if (lowerExt === '.xls') {

@@ -2,6 +2,7 @@
   const MIME_TYPES = {
     xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    pdf: 'application/pdf',
     txt: 'text/plain;charset=utf-8',
     zip: 'application/zip',
   };
@@ -17,6 +18,7 @@
     const extension = getExtension(fileName);
     if (extension === 'xlsx') return MIME_TYPES.xlsx;
     if (extension === 'docx') return MIME_TYPES.docx;
+    if (extension === 'pdf') return MIME_TYPES.pdf;
     if (extension === 'txt') return MIME_TYPES.txt;
     if (extension === 'zip') return MIME_TYPES.zip;
     return '';

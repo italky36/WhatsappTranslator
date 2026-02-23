@@ -154,41 +154,49 @@ async function handleLogout() {
 
 async function getAuthStatus() {
   const { accessToken, user } = await chrome.storage.local.get(['accessToken', 'user']);
-  
+
   if (!accessToken) {
     return { authenticated: false };
   }
 
   // Verify token
-  const response = await apiCall('/auth/me');
-  
-  if (response.ok) {
-    const userData = await response.json();
-    await chrome.storage.local.set({ user: userData });
-    return { authenticated: true, user: userData };
-  } else {
-    await clearTokens();
+  try {
+    const response = await apiCall('/auth/me');
+
+    if (response.ok) {
+      const userData = await response.json();
+      await chrome.storage.local.set({ user: userData });
+      return { authenticated: true, user: userData };
+    } else {
+      await clearTokens();
+      return { authenticated: false };
+    }
+  } catch (error) {
     return { authenticated: false };
   }
 }
 
 async function handleTranslate({ text, source, target, direction }) {
-  const response = await apiCall('/translate', {
-    method: 'POST',
-    body: JSON.stringify({
-      text,
-      source: source || 'auto',
-      target,
-      context: { direction },
-    }),
-  });
+  try {
+    const response = await apiCall('/translate', {
+      method: 'POST',
+      body: JSON.stringify({
+        text,
+        source: source || 'auto',
+        target,
+        context: { direction },
+      }),
+    });
 
-  const data = await response.json();
+    const data = await response.json();
 
-  if (response.ok) {
-    return { success: true, ...data };
-  } else {
-    return { success: false, error: data.error };
+    if (response.ok) {
+      return { success: true, ...data };
+    } else {
+      return { success: false, error: data.error };
+    }
+  } catch (error) {
+    return { success: false, error: 'Connection failed' };
   }
 }
 
@@ -228,11 +236,15 @@ async function handleUiLanguageChanged(lang) {
 }
 
 async function getUsage() {
-  const response = await apiCall('/usage');
-  if (response.ok) {
-    return await response.json();
+  try {
+    const response = await apiCall('/usage');
+    if (response.ok) {
+      return await response.json();
+    }
+    return null;
+  } catch (error) {
+    return null;
   }
-  return null;
 }
 
 async function handleTranslateBatch({ segments, source, target }) {
