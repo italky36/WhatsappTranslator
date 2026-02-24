@@ -346,3 +346,57 @@
 .wt-switch input:checked + .wt-slider::before {
   transform: translateX(16px);
 }
+
+/* Document import action in WhatsApp context menus */
+.wt-doc-menu-item {
+  padding: 10px 14px;
+  cursor: pointer;
+  color: #111b21;
+  font-size: 14px;
+  line-height: 1.3;
+  user-select: none;
+}
+
+.wt-doc-menu-item:hover {
+  background: rgba(134, 150, 160, 0.14);
+}
+
+.wt-doc-menu-item.loading {
+  opacity: 0.8;
+  pointer-events: none;
+}
+
+/* Lightweight toast for document import actions */
+.wt-doc-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #fff;
+  background: #3b4a54;
+  z-index: 10000;
+  max-width: min(90vw, 560px);
+  text-align: center;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+  display: none;
+}
+
+.wt-doc-toast.info {
+  background: #3b4a54;
+}
+
+.wt-doc-toast.success {
+  background: #128c7e;
+}
+
+.wt-doc-toast.warning {
+  background: #ed8936;
+}
+
+.wt-doc-toast.error {
+  background: #c53030;
+}

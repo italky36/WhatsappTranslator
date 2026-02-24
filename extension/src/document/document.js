@@ -76,6 +76,8 @@ const i18n = {
     docConnectionLost: 'Connection lost. Retrying...',
     docLargeFileProcessing: 'Processing large file...',
     docSegmentProgress: 'Segment {current} of {total}',
+    docImportingFromChat: 'Loading document from chat...',
+    docImportFailed: 'Failed to load document from chat',
   },
   ru: {
     docPageTitle: 'Перевод документов',
@@ -151,6 +153,8 @@ const i18n = {
     docConnectionLost: 'Соединение потеряно. Повторная попытка...',
     docLargeFileProcessing: 'Обработка большого файла...',
     docSegmentProgress: 'Сегмент {current} из {total}',
+    docImportingFromChat: 'Загрузка документа из чата...',
+    docImportFailed: 'Не удалось загрузить документ из чата',
   },
 };
 
@@ -169,6 +173,7 @@ let currentPreviewSheet = '';
 let isArchiveDownloadInProgress = false;
 let globalHandlersBound = false;
 let lastConnectionToastAt = 0;
+let consumedImportId = '';
 
 function t(key) {
   return i18n[currentLang]?.[key] || i18n.en[key] || key;
@@ -219,6 +224,121 @@ function formatFileSize(bytes) {
 function formatNumber(num) {
   const locale = currentLang === 'ru' ? 'ru-RU' : 'en-US';
   return Number(num || 0).toLocaleString(locale);
+}
+
+function getImportIdFromLocation() {
+  try {
+    const params = new URLSearchParams(window.location.search || '');
+    const importId = params.get('importId') || '';
+    return String(importId).trim();
+  } catch {
+    return '';
+  }
+}
+
+function clearImportIdFromLocation() {
+  try {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has('importId')) return;
+    url.searchParams.delete('importId');
+
+    const queryString = url.searchParams.toString();
+    const nextUrl = queryString ? `${url.pathname}?${queryString}${url.hash}` : `${url.pathname}${url.hash}`;
+    window.history.replaceState({}, document.title, nextUrl);
+  } catch {}
+}
+
+async function preloadImportedDocumentFromQuery() {
+  const importId = getImportIdFromLocation();
+  if (!importId || importId === consumedImportId) return;
+
+  consumedImportId = importId;
+  showNotification(t('docImportingFromChat'), 'info');
+
+  try {
+    const meta = await waitForDocumentImportMeta(importId, 24, 300);
+    if (!meta) {
+      throw new Error('IMPORT_META_NOT_FOUND');
+    }
+
+    const file = await buildFileFromImportedChunks(importId, meta);
+    if (!file) {
+      throw new Error('IMPORT_FILE_BUILD_FAILED');
+    }
+
+    await handleFiles([file]);
+  } catch (error) {
+    console.error('Failed to preload imported document:', error);
+    showNotification(t('docImportFailed'), 'error');
+  } finally {
+    try {
+      await sendMessage({ type: 'CLEAR_DOCUMENT_IMPORT', data: { importId } });
+    } catch {}
+    clearImportIdFromLocation();
+  }
+}
+
+async function waitForDocumentImportMeta(importId, maxAttempts = 20, delayMs = 250) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const response = await sendMessage({
+      type: 'GET_DOCUMENT_IMPORT_META',
+      data: { importId },
+    });
+
+    if (response?.success && response.meta) {
+      const meta = response.meta;
+      const received = Number(meta.receivedChunks || 0);
+      const total = Math.max(1, Number(meta.totalChunks || 1));
+      if (meta.status === 'ready' || received >= total) {
+        return meta;
+      }
+    } else if (response?.error?.code === 'NOT_FOUND') {
+      return null;
+    }
+
+    await sleep(delayMs);
+  }
+
+  return null;
+}
+
+async function buildFileFromImportedChunks(importId, meta) {
+  const totalChunks = Math.max(1, Number(meta?.totalChunks || 1));
+  const blobParts = [];
+
+  for (let index = 0; index < totalChunks; index++) {
+    const chunkResponse = await sendMessage({
+      type: 'GET_DOCUMENT_IMPORT_CHUNK',
+      data: { importId, index },
+    });
+
+    if (!chunkResponse?.success || !chunkResponse.base64Chunk) {
+      throw new Error(`IMPORT_CHUNK_MISSING_${index}`);
+    }
+
+    blobParts.push(base64ChunkToUint8Array(chunkResponse.base64Chunk));
+  }
+
+  const mimeType = String(meta?.mimeType || '').trim() || 'application/octet-stream';
+  const blob = new Blob(blobParts, { type: mimeType });
+  const fileName = String(meta?.fileName || 'document').trim() || 'document';
+  return new File([blob], fileName, {
+    type: mimeType,
+    lastModified: Date.now(),
+  });
+}
+
+function base64ChunkToUint8Array(base64Chunk) {
+  const binary = atob(String(base64Chunk || ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getNotificationHost() {
@@ -372,6 +492,7 @@ async function showMainContent() {
   setupLimitModal();
   setupResultsView();
   setupGlobalHandlers();
+  await preloadImportedDocumentFromQuery();
   showView('upload');
 }
 

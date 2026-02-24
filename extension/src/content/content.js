@@ -16,6 +16,18 @@
   let pendingSentTranslations = []; // [{ id, original, translated, translatedNorm, timestamp }]
   const PENDING_SENT_TTL_MS = 15000;
   const MAX_PENDING_SENT = 12;
+  const DOCUMENT_IMPORT_CHUNK_SIZE = 256 * 1024; // 256KB
+  const DOCUMENT_MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+  const SUPPORTED_DOCUMENT_EXTENSIONS = new Set(['docx', 'xlsx', 'xls', 'pdf']);
+  let isDocumentImportInProgress = false;
+  let lastDocumentMenuCandidate = null; // { row, documentInfo, timestamp }
+  let lastMessageRowCandidate = null; // { row, timestamp }
+  let documentMenuObserver = null;
+  const DOCUMENT_MENU_CANDIDATE_TTL_MS = 10000;
+  const OBSERVED_BLOB_TTL_MS = 15 * 60 * 1000; // 15 minutes
+  const MAX_OBSERVED_BLOBS = 40;
+  let pageBlobObserverInstalled = false;
+  let observedDocumentBlobs = []; // [{ url, type, size, ts }]
 
   // i18n for floating widget
   let uiLang = 'en';
@@ -28,6 +40,13 @@
       incoming: 'Incoming',
       outgoing: 'Outgoing',
       translating: 'Translating...',
+      translateDocument: 'Translate document',
+      preparingDocument: 'Preparing document...',
+      documentImportDone: 'Document opened in translation mode',
+      documentImportFailed: 'Failed to open document for translation',
+      documentNotDetected: 'Could not detect document in this message',
+      documentTooLarge: 'File is too large (max 50MB)',
+      documentAlreadyImporting: 'Please wait, document import is in progress',
     },
     ru: {
       header: 'Переводчик',
@@ -37,6 +56,13 @@
       incoming: 'Входящие',
       outgoing: 'Исходящие',
       translating: 'Переводим...',
+      translateDocument: 'Перевести документ',
+      preparingDocument: 'Подготовка документа...',
+      documentImportDone: 'Документ открыт в режиме перевода',
+      documentImportFailed: 'Не удалось открыть документ для перевода',
+      documentNotDetected: 'Не удалось определить документ в этом сообщении',
+      documentTooLarge: 'Файл слишком большой (макс. 50MB)',
+      documentAlreadyImporting: 'Подождите, идет импорт документа',
     },
   };
 
@@ -73,6 +99,10 @@
     // Optional: keep translate button (uses same send flow)
     injectTranslateButton();
 
+    // Add document import action into message context menus
+    startDocumentContextMenuIntegration();
+    installPageBlobUrlObserver();
+
   }
 
   // Communication with background
@@ -89,6 +119,11 @@
     if (message.type === 'UI_LANGUAGE_CHANGED') {
       uiLang = message.lang;
       applyWidgetLanguage();
+    }
+    if (message.type === 'TRIGGER_DOCUMENT_IMPORT_FROM_CONTEXT_MENU') {
+      handleExternalContextMenuTrigger(message.data).catch((error) => {
+        console.error('Context-menu document import failed:', error);
+      });
     }
   });
 
@@ -682,6 +717,974 @@
       el.textContent = wt(el.getAttribute('data-wt'));
     });
     if (fabClose) fabClose.title = wt('hideWidget');
+  }
+
+  // ===== Document Import From Chat =====
+
+  function startDocumentContextMenuIntegration() {
+    if (documentMenuObserver) return;
+
+    const captureCandidate = (event) => {
+      captureDocumentMenuCandidateFromEvent(event);
+      injectDocumentMenuItemIntoOpenMenus();
+    };
+
+    document.addEventListener('contextmenu', captureCandidate, true);
+    document.addEventListener('mousedown', captureCandidate, true);
+    document.addEventListener('click', captureCandidate, true);
+
+    documentMenuObserver = new MutationObserver(() => {
+      injectDocumentMenuItemIntoOpenMenus();
+    });
+    documentMenuObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function captureDocumentMenuCandidateFromEvent(event) {
+    const row = findMessageRowFromNode(event?.target);
+    if (!row) return;
+
+    lastMessageRowCandidate = {
+      row,
+      timestamp: Date.now(),
+    };
+
+    const documentInfo = extractDocumentInfoFromRow(row, { requireUrl: false });
+    if (!documentInfo) return;
+
+    lastDocumentMenuCandidate = {
+      row,
+      documentInfo,
+      timestamp: Date.now(),
+    };
+  }
+
+  function getActiveDocumentMenuCandidate() {
+    const docCandidate = getValidRowCandidate(lastDocumentMenuCandidate);
+    if (docCandidate?.documentInfo) {
+      return docCandidate;
+    }
+
+    const rowCandidate = getValidRowCandidate(lastMessageRowCandidate);
+    if (!rowCandidate?.row) return null;
+
+    const documentInfo = extractDocumentInfoFromRow(rowCandidate.row, { requireUrl: false });
+    if (!documentInfo) return null;
+
+    lastDocumentMenuCandidate = {
+      row: rowCandidate.row,
+      documentInfo,
+      timestamp: Date.now(),
+    };
+    return lastDocumentMenuCandidate;
+  }
+
+  function getValidRowCandidate(candidate) {
+    if (!candidate?.row) return null;
+    if (Date.now() - Number(candidate.timestamp || 0) > DOCUMENT_MENU_CANDIDATE_TTL_MS) {
+      return null;
+    }
+    if (!document.contains(candidate.row)) {
+      return null;
+    }
+    return candidate;
+  }
+
+  function findMessageRowFromNode(node) {
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!element) return null;
+
+    const selectors = [
+      '[data-id][role="row"]',
+      '[data-id]',
+      '[role="row"]',
+      'div.message-in',
+      'div.message-out',
+      'div[class*="message-in"]',
+      'div[class*="message-out"]',
+    ];
+
+    return element.closest(selectors.join(','));
+  }
+
+  function extractDocumentInfoFromRow(row, options = {}) {
+    const requireUrl = options.requireUrl !== false;
+    if (!row) return null;
+
+    const fileName = findDocumentFileName(row);
+    const extensionFromName = getExtensionFromName(fileName);
+    const fileUrl = findDocumentUrl(row);
+
+    if (fileUrl && !fileUrl.startsWith('blob:') && !/^https?:\/\//i.test(fileUrl)) return null;
+
+    const extension = extensionFromName || getExtensionFromUrl(fileUrl);
+    if (!SUPPORTED_DOCUMENT_EXTENSIONS.has(extension)) return null;
+    if (requireUrl && !fileUrl) return null;
+
+    const normalizedName = ensureFileNameWithExtension(fileName || `document.${extension}`, extension);
+    return {
+      fileName: normalizedName,
+      extension,
+      fileUrl: fileUrl || '',
+      mimeType: getDocumentMimeType(extension),
+    };
+  }
+
+  function findDocumentFileName(row) {
+    const downloadName = row.querySelector('a[download]')?.getAttribute('download');
+    if (downloadName && SUPPORTED_DOCUMENT_EXTENSIONS.has(getExtensionFromName(downloadName))) {
+      return normalizeFileName(downloadName);
+    }
+
+    const namePattern = /([^\n\r\t]+?\.(?:docx|xlsx|xls|pdf))\b/i;
+    const textNodes = row.querySelectorAll('span, div, a');
+    for (const node of textNodes) {
+      const text = String(node.textContent || '').trim();
+      if (!text) continue;
+      const match = text.match(namePattern);
+      if (match) {
+        return normalizeFileName(match[1]);
+      }
+    }
+
+    const rowText = String(row.innerText || row.textContent || '');
+    const rowMatch = rowText.match(namePattern);
+    if (rowMatch) {
+      return normalizeFileName(rowMatch[1]);
+    }
+
+    return '';
+  }
+
+  function findDocumentUrl(row) {
+    const candidates = collectDocumentUrlCandidates(row);
+    const blobUrl = candidates.find((value) => value.startsWith('blob:'));
+    if (blobUrl) return blobUrl;
+    const directUrl = candidates.find((value) => /^https?:\/\//i.test(value));
+    if (directUrl) return directUrl;
+    return '';
+  }
+
+  function collectDocumentUrlCandidates(rootNode) {
+    const candidates = [];
+    const seen = new Set();
+
+    const addCandidate = (rawValue) => {
+      const value = normalizeDocumentUrlCandidate(rawValue);
+      if (!value) return;
+      if (seen.has(value)) return;
+      seen.add(value);
+      candidates.push(value);
+    };
+
+    const scanNode = (node) => {
+      if (!(node instanceof Element)) return;
+
+      const attrs = node.getAttributeNames ? node.getAttributeNames() : [];
+      for (const name of attrs) {
+        const attrValue = node.getAttribute(name);
+        if (!attrValue) continue;
+        if (/href|url|src|blob|download/i.test(name)) {
+          addCandidate(attrValue);
+        }
+      }
+
+      addCandidate(node.getAttribute?.('href'));
+      addCandidate(node.getAttribute?.('src'));
+      addCandidate(node.getAttribute?.('data-href'));
+      addCandidate(node.getAttribute?.('data-url'));
+      addCandidate(node.getAttribute?.('data-src'));
+      addCandidate(node.getAttribute?.('style'));
+      addCandidate(node.dataset?.href);
+      addCandidate(node.dataset?.url);
+      addCandidate(node.dataset?.src);
+
+      if (typeof node.href === 'string') addCandidate(node.href);
+      if (typeof node.src === 'string') addCandidate(node.src);
+      if (typeof node.currentSrc === 'string') addCandidate(node.currentSrc);
+    };
+
+    scanNode(rootNode);
+    rootNode.querySelectorAll('*').forEach(scanNode);
+
+    const text = String(rootNode.innerText || rootNode.textContent || '');
+    const blobMatches = text.match(/blob:https:\/\/web\.whatsapp\.com\/[^\s"'`]+/ig) || [];
+    blobMatches.forEach(addCandidate);
+
+    return candidates;
+  }
+
+  function normalizeDocumentUrlCandidate(rawValue) {
+    const value = String(rawValue || '').trim();
+    if (!value) return '';
+
+    if (value.includes('blob:https://web.whatsapp.com/')) {
+      const match = value.match(/blob:https:\/\/web\.whatsapp\.com\/[^\s"'`)]+/i);
+      return match ? match[0] : '';
+    }
+
+    if (/^blob:/i.test(value)) return value;
+    if (/^https?:\/\//i.test(value)) return value;
+
+    if (/^url\(/i.test(value)) {
+      const match = value.match(/url\((['"]?)(.*?)\1\)/i);
+      const inner = match?.[2] || '';
+      if (/^blob:/i.test(inner) || /^https?:\/\//i.test(inner)) {
+        return inner;
+      }
+    }
+
+    return '';
+  }
+
+  function normalizeFileName(fileName) {
+    const value = String(fileName || '').trim();
+    if (!value) return '';
+    const withoutQuery = value.split('?')[0].split('#')[0];
+    const parts = withoutQuery.split(/[\\/]/g);
+    return parts[parts.length - 1].trim();
+  }
+
+  function getExtensionFromName(fileName) {
+    const normalized = normalizeFileName(fileName);
+    const dotIndex = normalized.lastIndexOf('.');
+    if (dotIndex < 0) return '';
+    return normalized.slice(dotIndex + 1).toLowerCase();
+  }
+
+  function getExtensionFromUrl(url) {
+    const value = String(url || '').split('?')[0].split('#')[0];
+    const match = value.match(/\.([a-z0-9]{2,5})$/i);
+    return match ? String(match[1]).toLowerCase() : '';
+  }
+
+  function ensureFileNameWithExtension(fileName, extension) {
+    const normalized = normalizeFileName(fileName);
+    if (!normalized) return `document.${extension}`;
+    const currentExt = getExtensionFromName(normalized);
+    if (currentExt === extension) return normalized;
+    if (!currentExt) return `${normalized}.${extension}`;
+    return normalized;
+  }
+
+  function getDocumentMimeType(extension) {
+    if (extension === 'docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    if (extension === 'xlsx' || extension === 'xls') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    if (extension === 'pdf') return 'application/pdf';
+    return 'application/octet-stream';
+  }
+
+  function getExtensionFromMimeType(mimeType) {
+    const value = String(mimeType || '').toLowerCase();
+    if (value.includes('pdf')) return 'pdf';
+    if (value.includes('wordprocessingml.document')) return 'docx';
+    if (value.includes('spreadsheetml.sheet') || value.includes('excel')) return 'xlsx';
+    return '';
+  }
+
+  function getVisibleContextMenuActions() {
+    const actions = [];
+    const selector = '[role="button"], button, [tabindex="0"]';
+    const actionLabelRegex = /(данные о сообщении|message info|скачать|download|переслать|forward|ответить|reply|удалить|delete|закрепить|pin|избранн|star|react|отреагировать)/i;
+
+    document.querySelectorAll(selector).forEach((node) => {
+      if (!(node instanceof Element)) return;
+      if (!node.isConnected) return;
+      if (node.classList.contains('wt-doc-menu-item')) return;
+      if (node.closest('.wt-fab-menu')) return;
+
+      const text = String(node.innerText || node.textContent || '').trim();
+      if (!text || !actionLabelRegex.test(text)) return;
+
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 18) return;
+      if (rect.bottom <= 0 || rect.top >= window.innerHeight) return;
+
+      actions.push(node);
+    });
+
+    return actions;
+  }
+
+  function findContextMenuContainerFromAction(actionNode) {
+    let node = actionNode;
+    let depth = 0;
+
+    while (node && depth < 8) {
+      const rect = node.getBoundingClientRect();
+      const buttonsCount = node.querySelectorAll('[role="button"], button').length;
+      if (rect.width >= 150 && rect.width <= 420 && rect.height >= 120 && buttonsCount >= 4) {
+        return node;
+      }
+      node = node.parentElement;
+      depth += 1;
+    }
+
+    return null;
+  }
+
+  function getContextMenuInsertionTargets() {
+    const targets = [];
+    const seen = new Set();
+
+    const actionNodes = getVisibleContextMenuActions();
+    for (const actionNode of actionNodes) {
+      const container = findContextMenuContainerFromAction(actionNode);
+      if (!container || seen.has(container)) continue;
+      seen.add(container);
+      targets.push({ container, actionNode });
+    }
+
+    return targets;
+  }
+
+  function injectDocumentMenuItemIntoOpenMenus() {
+    const candidate = getActiveDocumentMenuCandidate();
+    if (!candidate) return;
+
+    const targets = getContextMenuInsertionTargets();
+    for (const target of targets) {
+      if (target.container.querySelector('.wt-doc-menu-item')) continue;
+      appendDocumentMenuItem(target.container, candidate, target.actionNode);
+    }
+  }
+
+  function createDocumentMenuItemTemplate(templateNode) {
+    const item = templateNode instanceof Element
+      ? templateNode.cloneNode(true)
+      : document.createElement('div');
+
+    item.classList.add('wt-doc-menu-item');
+    item.removeAttribute?.('aria-disabled');
+    item.removeAttribute?.('data-animate-dropdown-item');
+    item.removeAttribute?.('id');
+    item.setAttribute?.('role', 'button');
+    item.tabIndex = 0;
+
+    const label = wt('translateDocument');
+    const labelNode = Array.from(item.querySelectorAll('span, div')).find((node) => {
+      if (!(node instanceof Element)) return false;
+      if (node.children.length > 0) return false;
+      return String(node.textContent || '').trim().length > 0;
+    });
+
+    if (labelNode) {
+      labelNode.textContent = label;
+    } else {
+      item.textContent = label;
+    }
+
+    return item;
+  }
+
+  function appendDocumentMenuItem(container, candidateSnapshot, anchorNode) {
+    const item = createDocumentMenuItemTemplate(anchorNode);
+
+    const onActivate = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      await handleDocumentMenuImport(candidateSnapshot, item);
+    };
+
+    item.addEventListener('click', onActivate);
+    item.addEventListener('keydown', async (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        await onActivate(event);
+      }
+    });
+
+    if (anchorNode && anchorNode.parentElement === container) {
+      anchorNode.insertAdjacentElement('afterend', item);
+    } else {
+      container.appendChild(item);
+    }
+  }
+
+  async function handleDocumentMenuImport(candidateSnapshot, menuItem) {
+    if (isDocumentImportInProgress) {
+      showDocumentToast(wt('documentAlreadyImporting'), 'warning');
+      return;
+    }
+
+    const active = candidateSnapshot || getActiveDocumentMenuCandidate();
+    const documentInfo = await resolveDocumentInfoForImportAsync(active, { menuItem });
+    if (!documentInfo?.fileUrl) {
+      const reasonCode = diagnoseMissingDocumentUrl(active, documentInfo, { menuItem });
+      showDocumentToast(`${wt('documentNotDetected')} [${reasonCode}]`, 'error');
+      return;
+    }
+
+    isDocumentImportInProgress = true;
+    const originalLabel = menuItem?.textContent || wt('translateDocument');
+    if (menuItem) {
+      menuItem.classList.add('loading');
+      menuItem.textContent = wt('preparingDocument');
+    }
+    showDocumentToast(wt('preparingDocument'), 'info');
+
+    let importPayload = { ...documentInfo };
+    try {
+      await importDocumentToTranslationPage(importPayload);
+      showDocumentToast(wt('documentImportDone'), 'success');
+    } catch (error) {
+      const initialCode = getImportErrorCode(error);
+      if (isFetchDocumentErrorCode(initialCode) && active?.row) {
+        try {
+          const freshUrl = await discoverDocumentUrlViaDownloadButton(active.row, importPayload, {
+            menuItem,
+            forceNew: true,
+            currentUrl: importPayload.fileUrl,
+          });
+          if (freshUrl && freshUrl !== importPayload.fileUrl) {
+            importPayload = { ...importPayload, fileUrl: freshUrl };
+            await importDocumentToTranslationPage(importPayload);
+            showDocumentToast(wt('documentImportDone'), 'success');
+            return;
+          }
+        } catch (retryError) {
+          error = retryError;
+        }
+      }
+
+      console.error('Document import failed:', error);
+      const isTooLarge = String(error?.message || '').includes('DOCUMENT_TOO_LARGE');
+      const code = isTooLarge ? 'DOCUMENT_TOO_LARGE' : getImportErrorCode(error);
+      const base = isTooLarge ? wt('documentTooLarge') : wt('documentImportFailed');
+      showDocumentToast(`${base} [${code}]`, 'error');
+    } finally {
+      if (menuItem) {
+        menuItem.classList.remove('loading');
+        menuItem.textContent = originalLabel;
+      }
+      isDocumentImportInProgress = false;
+    }
+  }
+
+  function resolveDocumentInfoForImport(candidate) {
+    if (!candidate) return null;
+
+    const row = candidate.row;
+    const fromCandidate = candidate.documentInfo ? { ...candidate.documentInfo } : null;
+    const fromRow = row ? extractDocumentInfoFromRow(row, { requireUrl: false }) : null;
+    const merged = {
+      ...(fromRow || {}),
+      ...(fromCandidate || {}),
+    };
+
+    if (fromCandidate?.fileUrl) {
+      merged.fileUrl = fromCandidate.fileUrl;
+    } else if (fromRow?.fileUrl) {
+      merged.fileUrl = fromRow.fileUrl;
+    }
+
+    if (!merged.extension) {
+      merged.extension = getExtensionFromName(merged.fileName) || getExtensionFromUrl(merged.fileUrl);
+    }
+    if (merged.extension && !SUPPORTED_DOCUMENT_EXTENSIONS.has(merged.extension)) {
+      return null;
+    }
+
+    if (!merged.fileName && merged.extension) {
+      merged.fileName = `document.${merged.extension}`;
+    }
+    if (merged.fileName && merged.extension) {
+      merged.fileName = ensureFileNameWithExtension(merged.fileName, merged.extension);
+    }
+
+    merged.mimeType = merged.mimeType || getDocumentMimeType(merged.extension || 'pdf');
+    return merged;
+  }
+
+  async function resolveDocumentInfoForImportAsync(candidate, options = {}) {
+    const resolved = resolveDocumentInfoForImport(candidate);
+    if (!resolved) return null;
+    if (resolved.fileUrl) return resolved;
+
+    const row = candidate?.row;
+    if (!row && !options.menuItem) return resolved;
+
+    const discoveredUrl = await discoverDocumentUrlViaDownloadButton(row, resolved, options);
+    if (discoveredUrl) {
+      resolved.fileUrl = discoveredUrl;
+      if (!resolved.extension) {
+        resolved.extension = getExtensionFromUrl(discoveredUrl) || getExtensionFromName(resolved.fileName);
+      }
+      if (resolved.extension && resolved.fileName) {
+        resolved.fileName = ensureFileNameWithExtension(resolved.fileName, resolved.extension);
+      }
+      if (!resolved.mimeType && resolved.extension) {
+        resolved.mimeType = getDocumentMimeType(resolved.extension);
+      }
+    }
+
+    return resolved;
+  }
+
+  function findRowDownloadButton(row) {
+    if (!row) return null;
+    const selectors = [
+      '[data-icon*="download"]',
+      '[data-testid*="download"]',
+      'button[aria-label*="Download"]',
+      'button[aria-label*="Скачать"]',
+      'div[aria-label*="Download"]',
+      'div[aria-label*="Скачать"]',
+    ];
+
+    for (const selector of selectors) {
+      const node = row.querySelector(selector);
+      if (!node) continue;
+      const clickable = node.closest('button, [role="button"], a') || node;
+      if (clickable instanceof Element) {
+        return clickable;
+      }
+    }
+
+    return null;
+  }
+
+  function findMenuDownloadButton(menuItem) {
+    if (!(menuItem instanceof Element)) return null;
+
+    const container = menuItem.parentElement || menuItem.closest('[role="menu"]') || menuItem;
+    if (!(container instanceof Element)) return null;
+
+    const actionRegex = /\b(скачать|download)\b/i;
+    const candidates = container.querySelectorAll('[role="button"], button, [tabindex], div');
+    for (const node of candidates) {
+      if (!(node instanceof Element)) continue;
+      if (node === menuItem || menuItem.contains(node) || node.contains(menuItem)) continue;
+      const text = String(node.innerText || node.textContent || '').trim();
+      if (!text || !actionRegex.test(text)) continue;
+      const clickable = node.closest('button, [role="button"], [tabindex]') || node;
+      if (clickable instanceof Element) {
+        return clickable;
+      }
+    }
+
+    return null;
+  }
+
+  async function discoverDocumentUrlViaDownloadButton(row, hint = null, options = {}) {
+    const directCandidates = row ? collectDocumentUrlCandidates(row) : [];
+    const currentUrl = String(options.currentUrl || '');
+    const directBlob = directCandidates.find((value) => {
+      if (!value.startsWith('blob:')) return false;
+      if (options.forceNew && currentUrl && value === currentUrl) return false;
+      return true;
+    });
+    if (directBlob) return directBlob;
+
+    const button = findRowDownloadButton(row) || findMenuDownloadButton(options.menuItem);
+    if (!button) return '';
+
+    const knownBefore = new Set(collectDocumentUrlCandidates(document.body));
+    const observedBefore = new Set(getObservedBlobCandidates().map((item) => item.url));
+    const preferredExtension = String(hint?.extension || '').toLowerCase();
+
+    try {
+      button.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+    } catch {}
+
+    await waitMs(20);
+
+    try {
+      button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    } catch {}
+
+    const observedBlob = await waitForObservedBlobUrl({
+      seenUrls: observedBefore,
+      preferredExtension,
+      timeoutMs: 2200,
+    });
+    if (observedBlob) return observedBlob;
+
+    await waitMs(350);
+
+    const afterCandidates = collectDocumentUrlCandidates(document.body);
+    const newBlob = afterCandidates.find((value) => value.startsWith('blob:') && !knownBefore.has(value));
+    if (newBlob) return newBlob;
+
+    // Fallback: WhatsApp may reuse an existing blob URL instead of creating a new one.
+    if (!options.forceNew) {
+      const reusableObservedBlob = pickObservedBlobUrl(getObservedBlobCandidates(), {
+        preferredExtension,
+        seenUrls: new Set(),
+      });
+      if (reusableObservedBlob) return reusableObservedBlob;
+    }
+
+    if (row) {
+      const rowCandidates = collectDocumentUrlCandidates(row);
+      const rowBlob = rowCandidates.find((value) => value.startsWith('blob:'));
+      if (rowBlob) return rowBlob;
+    }
+
+    return '';
+  }
+
+  async function waitForObservedBlobUrl(options = {}) {
+    const timeoutMs = Math.max(200, Number(options.timeoutMs || 1800));
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const candidates = getObservedBlobCandidates();
+      const blobUrl = pickObservedBlobUrl(candidates, options);
+      if (blobUrl) return blobUrl;
+      await waitMs(60);
+    }
+
+    return '';
+  }
+
+  async function handleExternalContextMenuTrigger(payload) {
+    if (isDocumentImportInProgress) {
+      showDocumentToast(wt('documentAlreadyImporting'), 'warning');
+      return;
+    }
+
+    const activeCandidate = getActiveDocumentMenuCandidate();
+    const fallbackInfo = resolveDocumentInfoFromContextMenuPayload(payload);
+    const fromCandidate = await resolveDocumentInfoForImportAsync(activeCandidate);
+    const documentInfo = fromCandidate || fallbackInfo;
+    if (!documentInfo?.fileUrl) {
+      const reasonCode = diagnoseMissingDocumentUrl(activeCandidate, fromCandidate);
+      showDocumentToast(`${wt('documentNotDetected')} [${reasonCode}]`, 'error');
+      return;
+    }
+
+    isDocumentImportInProgress = true;
+    showDocumentToast(wt('preparingDocument'), 'info');
+    let importPayload = { ...documentInfo };
+    try {
+      await importDocumentToTranslationPage(importPayload);
+      showDocumentToast(wt('documentImportDone'), 'success');
+    } catch (error) {
+      const initialCode = getImportErrorCode(error);
+      if (isFetchDocumentErrorCode(initialCode) && activeCandidate?.row) {
+        try {
+          const freshUrl = await discoverDocumentUrlViaDownloadButton(activeCandidate.row, importPayload, {
+            forceNew: true,
+            currentUrl: importPayload.fileUrl,
+          });
+          if (freshUrl && freshUrl !== importPayload.fileUrl) {
+            importPayload = { ...importPayload, fileUrl: freshUrl };
+            await importDocumentToTranslationPage(importPayload);
+            showDocumentToast(wt('documentImportDone'), 'success');
+            return;
+          }
+        } catch (retryError) {
+          error = retryError;
+        }
+      }
+
+      console.error('External document import failed:', error);
+      const isTooLarge = String(error?.message || '').includes('DOCUMENT_TOO_LARGE');
+      const code = isTooLarge ? 'DOCUMENT_TOO_LARGE' : getImportErrorCode(error);
+      const base = isTooLarge ? wt('documentTooLarge') : wt('documentImportFailed');
+      showDocumentToast(`${base} [${code}]`, 'error');
+    } finally {
+      isDocumentImportInProgress = false;
+    }
+  }
+
+  function diagnoseMissingDocumentUrl(candidate, resolvedInfo, options = {}) {
+    if (!candidate?.row) return 'NO_ACTIVE_ROW';
+    if (!resolvedInfo) return 'NO_DOCUMENT_INFO';
+    if (resolvedInfo.fileUrl) return 'OK';
+
+    const hasDownloadButton = Boolean(
+      findRowDownloadButton(candidate.row) ||
+      findMenuDownloadButton(options.menuItem)
+    );
+    if (!hasDownloadButton) return 'NO_DOWNLOAD_BUTTON';
+
+    const hasBlobObserved = getObservedBlobCandidates().length > 0;
+    return hasBlobObserved ? 'BLOB_NOT_MATCHED' : 'BLOB_NOT_OBSERVED';
+  }
+
+  function getImportErrorCode(error) {
+    const raw = String(error?.message || error || '').trim();
+    if (!raw) return 'UNKNOWN';
+    const match = raw.match(/[A-Z0-9_:-]{3,}/);
+    return match ? match[0] : raw.slice(0, 42);
+  }
+
+  function isFetchDocumentErrorCode(code) {
+    const value = String(code || '');
+    return value.startsWith('FETCH_DOCUMENT_FAILED');
+  }
+
+  function resolveDocumentInfoFromContextMenuPayload(payload) {
+    const linkUrl = String(payload?.linkUrl || '').trim();
+    const srcUrl = String(payload?.srcUrl || '').trim();
+    const selectionText = String(payload?.selectionText || '').trim();
+    const sourceUrl = linkUrl || srcUrl;
+    if (!sourceUrl) return null;
+
+    if (!sourceUrl.startsWith('blob:') && !/^https?:\/\//i.test(sourceUrl)) {
+      return null;
+    }
+
+    const nameFromSelection = extractFileNameFromText(selectionText);
+    const extensionFromName = getExtensionFromName(nameFromSelection);
+    const extensionFromUrl = getExtensionFromUrl(sourceUrl);
+    const extension = extensionFromName || extensionFromUrl;
+    if (!SUPPORTED_DOCUMENT_EXTENSIONS.has(extension) && !sourceUrl.startsWith('blob:')) {
+      return null;
+    }
+
+    const normalizedName = ensureFileNameWithExtension(nameFromSelection || `document.${extension || 'pdf'}`, extension || 'pdf');
+    return {
+      fileName: normalizedName,
+      extension: extension || '',
+      fileUrl: sourceUrl,
+      mimeType: extension ? getDocumentMimeType(extension) : 'application/octet-stream',
+    };
+  }
+
+  function extractFileNameFromText(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    const match = text.match(/([^\n\r\t]+?\.(?:docx|xlsx|xls|pdf))\b/i);
+    return match ? normalizeFileName(match[1]) : '';
+  }
+
+  function installPageBlobUrlObserver() {
+    if (pageBlobObserverInstalled) return;
+    pageBlobObserverInstalled = true;
+
+    window.addEventListener('message', (event) => {
+      if (event.source !== window) return;
+      const data = event.data;
+      if (!data || data.__wtBlobObserver !== true || data.type !== 'blob-created') return;
+
+      const url = String(data.url || '');
+      if (!url.startsWith('blob:')) return;
+
+      rememberObservedBlob({
+        url,
+        type: String(data.mimeType || ''),
+        size: Number(data.size || 0),
+        ts: Number(data.ts || Date.now()),
+      });
+    }, true);
+
+    const scriptId = 'wt-blob-observer-page-script';
+    if (document.getElementById(scriptId)) return;
+
+    const script = document.createElement('script');
+    script.id = scriptId;
+    script.type = 'text/javascript';
+    script.src = chrome.runtime.getURL('src/content/page-blob-observer.js');
+    script.onload = () => {
+      script.remove();
+    };
+    script.onerror = () => {
+      console.error('Failed to load page blob observer script');
+      script.remove();
+    };
+
+    (document.documentElement || document.head || document.body).appendChild(script);
+  }
+
+  function rememberObservedBlob(record) {
+    if (!record?.url) return;
+
+    cleanupObservedBlobs();
+
+    const existingIndex = observedDocumentBlobs.findIndex((item) => item.url === record.url);
+    if (existingIndex >= 0) {
+      observedDocumentBlobs[existingIndex] = {
+        ...observedDocumentBlobs[existingIndex],
+        ...record,
+      };
+    } else {
+      observedDocumentBlobs.push({
+        url: record.url,
+        type: String(record.type || ''),
+        size: Number(record.size || 0),
+        ts: Number(record.ts || Date.now()),
+      });
+    }
+
+    if (observedDocumentBlobs.length > MAX_OBSERVED_BLOBS) {
+      observedDocumentBlobs = observedDocumentBlobs.slice(-MAX_OBSERVED_BLOBS);
+    }
+  }
+
+  function cleanupObservedBlobs() {
+    const now = Date.now();
+    observedDocumentBlobs = observedDocumentBlobs.filter((item) => {
+      const ts = Number(item?.ts || 0);
+      if (!item?.url || !ts) return false;
+      return now - ts <= OBSERVED_BLOB_TTL_MS;
+    });
+  }
+
+  function getObservedBlobCandidates() {
+    cleanupObservedBlobs();
+    return observedDocumentBlobs.slice();
+  }
+
+  function pickObservedBlobUrl(candidates, options = {}) {
+    const seenUrls = options.seenUrls || new Set();
+    const preferredExtension = String(options.preferredExtension || '').toLowerCase();
+
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const item = candidates[i];
+      if (!item?.url || seenUrls.has(item.url)) continue;
+      if (!item.url.startsWith('blob:')) continue;
+
+      if (preferredExtension) {
+        const extFromType = getExtensionFromMimeType(item.type);
+        if (extFromType && extFromType !== preferredExtension) continue;
+      }
+
+      return item.url;
+    }
+
+    return '';
+  }
+
+  async function importDocumentToTranslationPage(documentInfo) {
+    const fileResponse = await fetch(documentInfo.fileUrl, { credentials: 'include' });
+    if (!fileResponse.ok) {
+      throw new Error(`FETCH_DOCUMENT_FAILED_${fileResponse.status}`);
+    }
+
+    const fileBlob = await fileResponse.blob();
+    if (!(fileBlob instanceof Blob) || fileBlob.size <= 0) {
+      throw new Error('EMPTY_DOCUMENT_BLOB');
+    }
+    if (fileBlob.size > DOCUMENT_MAX_FILE_SIZE) {
+      throw new Error('DOCUMENT_TOO_LARGE');
+    }
+
+    const extensionFromMime = getExtensionFromMimeType(fileBlob.type || documentInfo.mimeType || '');
+    const extension = documentInfo.extension ||
+      getExtensionFromName(documentInfo.fileName) ||
+      getExtensionFromUrl(documentInfo.fileUrl) ||
+      extensionFromMime ||
+      'pdf';
+    if (!SUPPORTED_DOCUMENT_EXTENSIONS.has(extension)) {
+      throw new Error('UNSUPPORTED_DOCUMENT_EXTENSION');
+    }
+    const fileName = ensureFileNameWithExtension(documentInfo.fileName, extension);
+    const mimeType = fileBlob.type || documentInfo.mimeType || getDocumentMimeType(extension);
+    const totalChunks = Math.max(1, Math.ceil(fileBlob.size / DOCUMENT_IMPORT_CHUNK_SIZE));
+
+    // Keep a reusable mapping for repeated imports of the same document.
+    rememberObservedBlob({
+      url: documentInfo.fileUrl,
+      type: mimeType,
+      size: Number(fileBlob.size || 0),
+      ts: Date.now(),
+    });
+
+    const startResponse = await sendMessage({
+      type: 'START_DOCUMENT_IMPORT',
+      data: {
+        fileName,
+        mimeType,
+        size: fileBlob.size,
+        totalChunks,
+      },
+    });
+
+    if (!startResponse?.success || !startResponse.importId) {
+      throw new Error(startResponse?.error?.message || 'IMPORT_START_FAILED');
+    }
+
+    const importId = startResponse.importId;
+    try {
+      for (let index = 0; index < totalChunks; index++) {
+        const start = index * DOCUMENT_IMPORT_CHUNK_SIZE;
+        const end = Math.min(start + DOCUMENT_IMPORT_CHUNK_SIZE, fileBlob.size);
+        const chunkBlob = fileBlob.slice(start, end);
+        const base64Chunk = await blobToBase64Chunk(chunkBlob);
+
+        const chunkResponse = await sendMessage({
+          type: 'APPEND_DOCUMENT_IMPORT_CHUNK',
+          data: {
+            importId,
+            index,
+            base64Chunk,
+          },
+        });
+
+        if (!chunkResponse?.success) {
+          throw new Error(chunkResponse?.error?.message || 'IMPORT_CHUNK_FAILED');
+        }
+      }
+
+      const completeResponse = await sendMessage({
+        type: 'COMPLETE_DOCUMENT_IMPORT',
+        data: { importId },
+      });
+      if (!completeResponse?.success) {
+        throw new Error(completeResponse?.error?.message || 'IMPORT_COMPLETE_FAILED');
+      }
+
+      const openResponse = await sendMessage({
+        type: 'OPEN_DOCUMENT_IMPORT_PAGE',
+        data: { importId },
+      });
+      if (!openResponse?.success) {
+        throw new Error(openResponse?.error?.message || 'IMPORT_OPEN_PAGE_FAILED');
+      }
+    } catch (error) {
+      try {
+        await sendMessage({ type: 'CLEAR_DOCUMENT_IMPORT', data: { importId } });
+      } catch {}
+      throw error;
+    }
+  }
+
+  function blobToBase64Chunk(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const raw = String(reader.result || '');
+        const commaIndex = raw.indexOf(',');
+        resolve(commaIndex >= 0 ? raw.slice(commaIndex + 1) : raw);
+      };
+      reader.onerror = () => {
+        reject(reader.error || new Error('Failed to read chunk'));
+      };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function waitMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  let documentToastNode = null;
+  let documentToastTimer = null;
+
+  function showDocumentToast(message, type = 'info') {
+    if (!message) return;
+
+    if (!documentToastNode) {
+      documentToastNode = document.createElement('div');
+      documentToastNode.className = 'wt-doc-toast';
+      document.body.appendChild(documentToastNode);
+    }
+
+    documentToastNode.className = `wt-doc-toast ${type}`;
+    documentToastNode.textContent = message;
+    documentToastNode.style.display = 'block';
+
+    if (documentToastTimer) {
+      clearTimeout(documentToastTimer);
+    }
+    documentToastTimer = setTimeout(() => {
+      if (documentToastNode) {
+        documentToastNode.style.display = 'none';
+      }
+    }, type === 'error' ? 4200 : 2800);
   }
 
   // Inject translate button for outgoing messages

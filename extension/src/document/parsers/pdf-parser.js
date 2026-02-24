@@ -914,6 +914,83 @@ function wrapTextForPdf(text, maxWidth, fontSize, font) {
 // Phase 8: PDF Assembly via pdf-lib
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * Remove all text operators (BT...ET blocks) from a PDF page's content stream.
+ * This prevents original text from being copy-pasted after translation overlay.
+ */
+function stripTextFromPage(page, pdfDoc) {
+  const contentsRef = page.node.get(PDFLib.PDFName.of('Contents'));
+  if (!contentsRef) return;
+
+  // Collect all stream references
+  const streamRefs = [];
+  const resolved = contentsRef instanceof PDFLib.PDFRef
+    ? pdfDoc.context.lookup(contentsRef)
+    : contentsRef;
+
+  if (resolved instanceof PDFLib.PDFArray) {
+    for (let i = 0; i < resolved.size(); i++) {
+      const ref = resolved.get(i);
+      if (ref instanceof PDFLib.PDFRef) {
+        streamRefs.push(ref);
+      }
+    }
+  } else if (contentsRef instanceof PDFLib.PDFRef) {
+    streamRefs.push(contentsRef);
+  }
+
+  for (const ref of streamRefs) {
+    try {
+      const stream = pdfDoc.context.lookup(ref);
+      if (!stream) continue;
+
+      // Decode the stream (handles FlateDecode etc.)
+      let decoded;
+      try {
+        const result = PDFLib.decodePDFRawStream(stream);
+        decoded = result.decode();
+      } catch (e) {
+        // If decode fails, try reading raw bytes
+        if (stream.contents || stream.getContents) {
+          decoded = stream.contents || stream.getContents();
+        } else {
+          continue;
+        }
+      }
+
+      // Convert Uint8Array to string
+      let text;
+      if (decoded instanceof Uint8Array) {
+        text = new TextDecoder('latin1').decode(decoded);
+      } else if (typeof decoded === 'string') {
+        text = decoded;
+      } else {
+        continue;
+      }
+
+      // Remove all BT...ET text blocks (non-greedy)
+      // BT and ET are always at operator boundaries (preceded by whitespace or start of line)
+      const cleaned = text.replace(/\bBT\b[\s\S]*?\bET\b/g, '\n');
+
+      if (cleaned === text) continue; // Nothing changed
+
+      // Create new uncompressed stream content
+      const newBytes = new TextEncoder().encode(cleaned);
+
+      // Build a new stream dict (remove FlateDecode filter since we write uncompressed)
+      const newDict = pdfDoc.context.obj({
+        Length: newBytes.length,
+      });
+
+      // Create new raw stream and replace in context
+      const newStream = PDFLib.PDFRawStream.of(newDict, newBytes);
+      pdfDoc.context.assign(ref, newStream);
+    } catch (e) {
+      console.warn('stripTextFromPage: failed to process stream:', e.message);
+    }
+  }
+}
+
 async function fetchFontBytes(relativePath) {
   const url = chrome.runtime.getURL(relativePath);
   const response = await fetch(url);
@@ -961,80 +1038,101 @@ async function assemblePDF(originalArrayBuffer, translatedSegments, metadata) {
     const pageSegments = segmentsByPage.get(pageNum) || [];
     const pageMeta = { width: pageWidth, height: pageHeight };
 
-    for (const segment of pageSegments) {
-      if (segment.meta?.skipTranslation) continue;
-      const translatedText = String(segment.translatedText || segment.text || '').trim();
-      if (!translatedText) continue;
+    // Remove all original text from the page content stream
+    // This prevents original text from being copy-pasted
+    try {
+      stripTextFromPage(page, pdfDoc);
+    } catch (e) {
+      console.warn(`stripTextFromPage failed for page ${pageNum}:`, e.message);
+    }
 
-      const layout = computeTextLayout(
-        translatedText, segment, pageMeta, pageSegments, regularFont, boldFont
-      );
+    // Draw ALL segments (both translated and skip-translated)
+    for (const segment of pageSegments) {
+      const isSkipped = !!segment.meta?.skipTranslation;
+      const textToDraw = isSkipped
+        ? String(segment.text || '').trim()
+        : String(segment.translatedText || segment.text || '').trim();
+      if (!textToDraw) continue;
 
       const activeFont = segment.meta?.style?.isBold ? boldFont : regularFont;
-      const padding = 1.5;
 
-      // Pre-validate: try encoding all lines before drawing anything
-      // This prevents white rectangles with no text when font can't render chars
-      const validLines = [];
-      let allLinesValid = true;
-      for (const line of layout.lines) {
+      // Pre-validate: try encoding text before drawing
+      const linesToDraw = [];
+      if (isSkipped) {
+        // Skip-translated: draw original text directly at original position
         try {
-          activeFont.encodeText(line);
-          validLines.push(line);
+          activeFont.encodeText(textToDraw);
+          linesToDraw.push(textToDraw);
         } catch (e) {
-          allLinesValid = false;
-          // Try character-by-character fallback: replace unsupported chars
-          let cleaned = '';
-          for (const ch of line) {
-            try {
-              activeFont.encodeText(ch);
-              cleaned += ch;
-            } catch (_) {
-              cleaned += '?';
+          // Can't encode original text with our font — skip silently
+          continue;
+        }
+      } else {
+        // Translated: use layout computation
+        const layout = computeTextLayout(
+          textToDraw, segment, pageMeta, pageSegments, regularFont, boldFont
+        );
+
+        for (const line of layout.lines) {
+          try {
+            activeFont.encodeText(line);
+            linesToDraw.push(line);
+          } catch (e) {
+            let cleaned = '';
+            for (const ch of line) {
+              try {
+                activeFont.encodeText(ch);
+                cleaned += ch;
+              } catch (_) {
+                cleaned += '?';
+              }
+            }
+            if (cleaned && cleaned !== '?'.repeat(line.length)) {
+              linesToDraw.push(cleaned);
             }
           }
-          if (cleaned && cleaned !== '?'.repeat(line.length)) {
-            validLines.push(cleaned);
-          }
         }
-      }
 
-      // Skip this segment entirely if no valid text to draw
-      if (!validLines.length) {
-        console.warn('Skipping segment — font cannot encode text:', translatedText.slice(0, 50));
+        if (!linesToDraw.length) {
+          console.warn('Skipping segment — font cannot encode text:', textToDraw.slice(0, 50));
+          continue;
+        }
+
+        // Draw translated text using computed layout
+        let textY = layout.bbox.y + layout.bbox.height - layout.fontSize;
+        for (const line of linesToDraw) {
+          if (textY < layout.bbox.y - layout.lineHeight * 0.1) break;
+          try {
+            page.drawText(line, {
+              x: layout.bbox.x,
+              y: textY,
+              size: layout.fontSize,
+              font: activeFont,
+              color: PDFLib.rgb(0, 0, 0),
+            });
+          } catch (e) {
+            console.warn('Failed to draw text line:', e.message);
+          }
+          textY -= layout.lineHeight;
+        }
         continue;
       }
 
-      // Draw white rectangles over original block positions
-      const origBlocks = segment.meta?.originalBlocks || [{ bbox: segment.meta.bbox }];
-      for (const ob of origBlocks) {
-        page.drawRectangle({
-          x: ob.bbox.x - padding,
-          y: ob.bbox.y - padding,
-          width: ob.bbox.width + padding * 2,
-          height: ob.bbox.height + padding * 2,
-          color: PDFLib.rgb(1, 1, 1),
-          borderWidth: 0,
-        });
-      }
-
-      // Draw translated text (PDF coords: top of bbox = bbox.y + bbox.height)
-      let textY = layout.bbox.y + layout.bbox.height - layout.fontSize;
-
-      for (const line of validLines) {
-        if (textY < layout.bbox.y - layout.lineHeight * 0.1) break;
+      // Draw skip-translated text at original position
+      const bbox = segment.meta?.bbox;
+      if (bbox && linesToDraw.length) {
+        const fontSize = segment.meta?.style?.fontSize || 10;
         try {
-          page.drawText(line, {
-            x: layout.bbox.x,
-            y: textY,
-            size: layout.fontSize,
+          page.drawText(linesToDraw[0], {
+            x: bbox.x,
+            y: bbox.y + bbox.height - fontSize,
+            size: fontSize,
             font: activeFont,
             color: PDFLib.rgb(0, 0, 0),
           });
         } catch (e) {
-          console.warn('Failed to draw text line:', e.message);
+          console.warn('Failed to draw skip-translated text:', e.message);
         }
-        textY -= layout.lineHeight;
       }
     }
   }

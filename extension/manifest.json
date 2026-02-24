@@ -6,7 +6,8 @@
   "permissions": [
     "storage",
     "activeTab",
-    "tabs"
+    "tabs",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://web.whatsapp.com/*"
@@ -40,6 +41,7 @@
     {
       "resources": [
         "libs/pdf.worker.min.js",
+        "src/content/page-blob-observer.js",
         "assets/fonts/NotoSans-Regular.ttf",
         "assets/fonts/NotoSans-Bold.ttf"
       ],
