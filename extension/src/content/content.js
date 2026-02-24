@@ -13,7 +13,9 @@
   let isSending = false;
   let bypassNextSend = false;
   let sendHookInterval = null;
-  let lastSentTranslation = null; // { original, translated, timestamp }
+  let pendingSentTranslations = []; // [{ id, original, translated, translatedNorm, timestamp }]
+  const PENDING_SENT_TTL_MS = 15000;
+  const MAX_PENDING_SENT = 12;
 
   // i18n for floating widget
   let uiLang = 'en';
@@ -109,6 +111,86 @@
       translatedMessages.delete(firstKey);
     }
     translatedMessages.set(key, translation);
+  }
+
+  function normalizeComparableText(value) {
+    return String(value || '')
+      .normalize('NFKC')
+      .replace(/[\u00A0]/g, ' ')
+      .replace(/[‘’`´]/g, "'")
+      .replace(/[“”]/g, '"')
+      .replace(/\s+/g, ' ')
+      .replace(/[.!?…]+$/g, '')
+      .trim()
+      .toLowerCase();
+  }
+
+  function cleanupPendingSentTranslations() {
+    const now = Date.now();
+    pendingSentTranslations = pendingSentTranslations.filter((item) => {
+      return item && (now - Number(item.timestamp || 0)) <= PENDING_SENT_TTL_MS;
+    });
+
+    if (pendingSentTranslations.length > MAX_PENDING_SENT) {
+      pendingSentTranslations = pendingSentTranslations.slice(-MAX_PENDING_SENT);
+    }
+  }
+
+  function registerPendingSentTranslation(original, translated) {
+    const entry = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      original: String(original || ''),
+      translated: String(translated || ''),
+      translatedNorm: normalizeComparableText(translated),
+      timestamp: Date.now(),
+    };
+    pendingSentTranslations.push(entry);
+    cleanupPendingSentTranslations();
+    return entry;
+  }
+
+  function findPendingSentByTranslated(text, preferredEntryId = null) {
+    cleanupPendingSentTranslations();
+    const normalized = normalizeComparableText(text);
+    if (!normalized) return { entry: null, index: -1 };
+    let looseMatch = { entry: null, index: -1 };
+
+    for (let i = pendingSentTranslations.length - 1; i >= 0; i--) {
+      const item = pendingSentTranslations[i];
+      if (!item || item.translatedNorm !== normalized) continue;
+      if (preferredEntryId && item.id !== preferredEntryId) continue;
+      return { entry: item, index: i };
+    }
+
+    for (let i = pendingSentTranslations.length - 1; i >= 0; i--) {
+      const item = pendingSentTranslations[i];
+      if (!item) continue;
+      if (preferredEntryId && item.id !== preferredEntryId) continue;
+
+      const candidate = item.translatedNorm || '';
+      if (!candidate) continue;
+      const minLen = Math.min(candidate.length, normalized.length);
+      if (minLen < 6) continue;
+
+      if (candidate.includes(normalized) || normalized.includes(candidate)) {
+        looseMatch = { entry: item, index: i };
+        break;
+      }
+    }
+
+    return looseMatch;
+  }
+
+  function findPendingSentById(id) {
+    cleanupPendingSentTranslations();
+    if (!id) return { entry: null, index: -1 };
+    for (let i = pendingSentTranslations.length - 1; i >= 0; i--) {
+      const item = pendingSentTranslations[i];
+      if (item?.id === id) {
+        return { entry: item, index: i };
+      }
+    }
+    return { entry: null, index: -1 };
   }
 
   // Get current chat ID (simplified)
@@ -230,9 +312,73 @@
   }
 
   function findMessageTextContainerFromSpan(span) {
+    if (!span) return null;
     return span.closest('[data-testid="msg-text"]') ||
       span.closest('div.copyable-text') ||
       span.closest('div');
+  }
+
+  function findPrimaryMessageTextElement(container) {
+    if (!container) return null;
+
+    const selectors = [
+      'span[data-testid="selectable-text"]',
+      '[data-testid="msg-text"] span[dir="auto"]',
+      '[data-testid="msg-text"] span[dir]',
+      '[data-testid="msg-text"]',
+      'div.copyable-text span[dir="auto"]',
+      'div.copyable-text span[dir]',
+      'div.copyable-text',
+      'span[dir="auto"]',
+      'span[dir]',
+    ];
+
+    for (const selector of selectors) {
+      const el = container.querySelector(selector);
+      if (!el) continue;
+      const text = (el.innerText || el.textContent || '').trim();
+      if (text) return el;
+    }
+
+    return null;
+  }
+
+  function extractMessageTextFromRow(row) {
+    const textElement = findPrimaryMessageTextElement(row);
+    if (!textElement) {
+      return { text: '', textElement: null };
+    }
+
+    return {
+      text: (textElement.innerText || textElement.textContent || '').trim(),
+      textElement,
+    };
+  }
+
+  function getMessageRows(root, outgoingOnly = true) {
+    if (!root) return [];
+
+    const selectors = [
+      '[data-id][role="row"]',
+      '[data-id]',
+      '[role="row"]',
+      'div.message-out',
+      'div[class*="message-out"]',
+      '[data-testid*="msg"]',
+    ];
+
+    const unique = new Set();
+    const rows = [];
+    for (const selector of selectors) {
+      root.querySelectorAll(selector).forEach((row) => {
+        if (!row || unique.has(row)) return;
+        if (outgoingOnly && !isOutgoingMessage(row)) return;
+        unique.add(row);
+        rows.push(row);
+      });
+    }
+
+    return rows;
   }
 
   function isOutgoingMessage(row) {
@@ -241,6 +387,9 @@
     if (row.closest('div.message-out')) return true;
     if (row.closest('div[class*="message-out"]')) return true;
     if (row.querySelector('[data-testid="msg-dblcheck"]')) return true;
+    if (row.querySelector('[data-testid*="dblcheck"], [data-testid*="msg-check"]')) return true;
+    if (row.querySelector('[data-icon*="dblcheck"], [data-icon*="msg-check"]')) return true;
+    if (row.querySelector('[aria-label*="Read"], [aria-label*="Delivered"]')) return true;
     return false;
   }
 
@@ -266,8 +415,8 @@
       if (isOutgoingMessage(row)) return;
 
       // Skip messages that match a recently sent translation (race condition guard)
-      if (lastSentTranslation && Date.now() - lastSentTranslation.timestamp < 6000 &&
-          text === lastSentTranslation.translated) {
+      const pendingMatch = findPendingSentByTranslated(text).entry;
+      if (pendingMatch && Date.now() - pendingMatch.timestamp < 6000) {
         row.dataset.extTranslated = '1';
         return;
       }
@@ -343,9 +492,8 @@
 
   // Display translation for a message
   function displayTranslation(messageElement, textSpan, translation, direction) {
-    const textContainer = textSpan
-      ? findMessageTextContainerFromSpan(textSpan)
-      : findMessageTextContainerFromSpan(messageElement.querySelector('span[data-testid="selectable-text"]'));
+    const primaryText = textSpan || findPrimaryMessageTextElement(messageElement);
+    const textContainer = findMessageTextContainerFromSpan(primaryText) || primaryText;
     if (!textContainer) return;
 
     // Remove existing translation if any
@@ -366,11 +514,17 @@
 
       // Dim the original text
       textContainer.classList.add('wt-original-dimmed');
+    } else if (direction === 'outgoing-original') {
+      // Outgoing sent message: show original text ABOVE the sent translation
+      const origEl = document.createElement('div');
+      origEl.className = `wt-translation style-${settings?.translationStyle || 'normal'} outgoing`;
+      origEl.textContent = translation;
+      anchor.insertBefore(origEl, textContainer);
     } else {
       // Outgoing: original text shown BELOW the sent translation
       const origEl = document.createElement('div');
       origEl.className = `wt-translation style-${settings?.translationStyle || 'normal'} ${direction}`;
-      origEl.textContent = translation; // "translation" here is actually the original text
+      origEl.textContent = translation;
       anchor.appendChild(origEl);
     }
 
@@ -560,8 +714,8 @@
       const inputDiv = document.querySelector('[data-testid="conversation-compose-box-input"] [contenteditable="true"]');
       if (!inputDiv) return;
 
-      const text = inputDiv.textContent?.trim();
-      if (!text || text.length < 2) return;
+      const text = inputDiv.textContent || '';
+      if (!text.trim() || text.trim().length < 2) return;
 
       btn.classList.add('loading');
 
@@ -670,7 +824,8 @@
       return;
     }
 
-    if (!originalText || originalText.trim().length < 2) return;
+    const originalForDisplay = String(originalText || '');
+    if (!originalForDisplay || originalForDisplay.trim().length < 2) return;
 
     if (isSending) return;
     isSending = true;
@@ -680,7 +835,7 @@
       const result = await sendMessage({
         type: 'TRANSLATE',
         data: {
-          text: originalText,
+          text: originalForDisplay,
           source: settings.sendSourceLanguage || 'auto',
           target: settings.sendTargetLanguage || 'EN',
           direction: 'outgoing'
@@ -697,12 +852,8 @@
           return;
         }
 
-        // Save original for display after send
-        lastSentTranslation = {
-          original: originalText,
-          translated: result.translatedText,
-          timestamp: Date.now(),
-        };
+        // Save exact user input to show above the sent translated message.
+        const pendingEntry = registerPendingSentTranslation(originalForDisplay, result.translatedText);
 
         const input = getInputBox();
         pasteTextIntoInput(input, result.translatedText);
@@ -711,7 +862,7 @@
         setTimeout(() => {
           triggerSendClick();
           // After send, find the sent message and annotate it
-          setTimeout(markLastSentMessage, 400);
+          setTimeout(() => markLastSentMessage(pendingEntry.id), 400);
         }, 80);
       } else {
         alert('Translation failed: ' + (result.error?.message || 'Unknown error'));
@@ -725,45 +876,76 @@
     }
   }
 
-  function markLastSentMessage() {
-    if (!lastSentTranslation) return;
-    // Only valid for 5 seconds after send
-    if (Date.now() - lastSentTranslation.timestamp > 5000) {
-      lastSentTranslation = null;
-      return;
-    }
+  function markLastSentMessage(preferredEntryId = null, attemptsLeft = 16) {
+    cleanupPendingSentTranslations();
+    if (!pendingSentTranslations.length) return;
 
     const root = findMessagesRoot();
     if (!root) return;
 
-    // Find the last outgoing message containing the translated text
-    const spans = root.querySelectorAll('span[data-testid="selectable-text"]');
+    // Find the last outgoing message containing translated text from pending queue
+    let rows = getMessageRows(root, true);
+    if (!rows.length) {
+      rows = getMessageRows(root, false);
+    }
     let targetRow = null;
-    let targetSpan = null;
+    let targetTextElement = null;
+    let targetEntry = null;
+    let targetEntryIndex = -1;
 
     // Search from the end (most recent messages)
-    for (let i = spans.length - 1; i >= 0; i--) {
-      const span = spans[i];
-      const row = findMessageRowFromTextSpan(span);
-      if (!row || !isOutgoingMessage(row)) continue;
-      const text = (span.innerText || span.textContent || '').trim();
-      if (text === lastSentTranslation.translated) {
-        targetRow = row;
-        targetSpan = span;
-        break;
-      }
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.dataset.extSentByUs === '1') continue;
+      if (row.querySelector('.wt-translation.outgoing')) continue;
+      const { text, textElement } = extractMessageTextFromRow(row);
+      if (!text || !textElement) continue;
+      const matched = findPendingSentByTranslated(text, preferredEntryId);
+      if (!matched.entry) continue;
+
+      targetRow = row;
+      targetTextElement = textElement;
+      targetEntry = matched.entry;
+      targetEntryIndex = matched.index;
+      break;
     }
 
-    if (targetRow && targetSpan) {
+    if (targetRow && targetTextElement && targetEntry) {
       // Mark so auto-translate skips this
       targetRow.dataset.extTranslated = '1';
       targetRow.dataset.extSentByUs = '1';
 
-      // Show original text below the translated (sent) message
-      displayTranslation(targetRow, targetSpan, lastSentTranslation.original, 'outgoing');
+      // Show original text ABOVE the translated (sent) message
+      displayTranslation(targetRow, targetTextElement, targetEntry.original, 'outgoing-original');
+
+      if (targetEntryIndex >= 0) {
+        pendingSentTranslations.splice(targetEntryIndex, 1);
+      }
+      return;
     }
 
-    lastSentTranslation = null;
+    if (attemptsLeft <= 1 && preferredEntryId) {
+      const pendingById = findPendingSentById(preferredEntryId);
+      if (pendingById.entry) {
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const row = rows[i];
+          if (row.dataset.extSentByUs === '1') continue;
+          if (row.querySelector('.wt-translation.outgoing')) continue;
+          const { textElement } = extractMessageTextFromRow(row);
+          if (!textElement) continue;
+
+          row.dataset.extTranslated = '1';
+          row.dataset.extSentByUs = '1';
+          displayTranslation(row, textElement, pendingById.entry.original, 'outgoing-original');
+          pendingSentTranslations.splice(pendingById.index, 1);
+          return;
+        }
+      }
+    }
+
+    if (attemptsLeft > 1) {
+      setTimeout(() => markLastSentMessage(preferredEntryId, attemptsLeft - 1), 250);
+    }
   }
 
   function hookSendButtons() {
@@ -784,8 +966,8 @@
           return;
         }
 
-        const text = getInputText().trim();
-        if (!text) return;
+        const text = getInputText();
+        if (!text.trim()) return;
 
         event.stopPropagation();
         event.preventDefault();
@@ -807,8 +989,8 @@
       if (isSending) return;
 
       if (event.key === 'Enter' && event.ctrlKey) {
-        const text = getInputText().trim();
-        if (!text) return;
+        const text = getInputText();
+        if (!text.trim()) return;
         event.stopPropagation();
         event.preventDefault();
         bypassNextSend = true;
@@ -817,8 +999,8 @@
       }
 
       if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey) {
-        const text = getInputText().trim();
-        if (!text) return;
+        const text = getInputText();
+        if (!text.trim()) return;
         event.stopPropagation();
         event.preventDefault();
         await translateAndSend(text);

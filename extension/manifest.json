@@ -38,7 +38,11 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["libs/pdf.worker.min.js"],
+      "resources": [
+        "libs/pdf.worker.min.js",
+        "assets/fonts/NotoSans-Regular.ttf",
+        "assets/fonts/NotoSans-Bold.ttf"
+      ],
       "matches": ["<all_urls>"]
     }
   ]

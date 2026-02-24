@@ -42,13 +42,17 @@ async function rebuildFile(originalFile, translatedSegments, options) {
     case 'docx':
       return rebuildWord(options.arrayBuffer, translatedSegments);
     case 'pdf': {
-      const markdown = buildTranslatedMarkdown(translatedSegments, options.metadata);
-      const pdfBlob = await buildTranslatedPdfFromMarkdown(markdown, options.metadata);
+      const pdfBlob = await assemblePDF(
+        options.metadata?.originalArrayBuffer,
+        translatedSegments,
+        options.metadata
+      );
+      const textContent = buildTranslatedText(translatedSegments, options.metadata);
       return {
         blob: pdfBlob,
         textBlob: new Blob(
-          [markdown],
-          { type: 'text/markdown;charset=utf-8' }
+          [textContent],
+          { type: 'text/plain;charset=utf-8' }
         ),
         htmlContent: buildTranslatedHTML(translatedSegments, options.metadata),
       };

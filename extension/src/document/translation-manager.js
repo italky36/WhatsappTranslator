@@ -132,6 +132,9 @@
         const allowedSheets = new Set(job.options.selectedSheets);
         filteredSegments = segments.filter((segment) => allowedSheets.has(segment?.meta?.sheet));
       }
+      if (metadata.type === 'pdf') {
+        filteredSegments = filteredSegments.filter((segment) => !segment?.meta?.skipTranslation);
+      }
 
       this._throwIfCancelled();
       job.status = 'translating';
