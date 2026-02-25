@@ -132,7 +132,20 @@
         const allowedSheets = new Set(job.options.selectedSheets);
         filteredSegments = segments.filter((segment) => allowedSheets.has(segment?.meta?.sheet));
       }
+      // For PDF: keep track of all page segments (including skip-translated)
+      // because assemblePDF needs them to redraw after stripTextFromPage
+      let allPdfPageSegments = null;
       if (metadata.type === 'pdf') {
+        if (Array.isArray(job.options.selectedPages)) {
+          const allowedPages = new Set(job.options.selectedPages);
+          filteredSegments = filteredSegments.filter((segment) => allowedPages.has(segment?.meta?.page));
+        }
+        // Line-by-line mode: split merged segments back into individual lines
+        if (job.options.lineByLine && typeof splitSegmentsIntoLines === 'function') {
+          filteredSegments = splitSegmentsIntoLines(filteredSegments);
+        }
+        // Save all segments (including skip-translated) for PDF assembly
+        allPdfPageSegments = filteredSegments.slice();
         filteredSegments = filteredSegments.filter((segment) => !segment?.meta?.skipTranslation);
       }
 
@@ -191,7 +204,26 @@
       job.progress = { phase: 'rebuilding', percent: 95 };
       this._emit(this.onProgress, job.id, job.progress);
 
-      const translatedSegments = translationResponse.segments;
+      let translatedSegments = translationResponse.segments;
+      // Attach selectedPages to metadata for PDF assembly
+      if (Array.isArray(job.options.selectedPages)) {
+        metadata.selectedPages = job.options.selectedPages;
+      }
+
+      // For PDF: merge translated segments with skip-translated ones for assembly
+      if (allPdfPageSegments) {
+        const translatedMap = new Map();
+        for (const seg of translatedSegments) {
+          translatedMap.set(seg.index, seg);
+        }
+        translatedSegments = allPdfPageSegments.map((seg) => {
+          const translated = translatedMap.get(seg.index);
+          if (translated) return translated;
+          // Skip-translated segment — keep original text
+          return { ...seg, translatedText: seg.text, isTranslated: false };
+        });
+      }
+
       const resultBlob = await rebuildFile(job.file, translatedSegments, {
         workbook: metadata.workbook,
         arrayBuffer: metadata.arrayBuffer,

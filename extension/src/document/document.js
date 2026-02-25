@@ -22,6 +22,8 @@ const i18n = {
     docFileTooLarge: 'File too large (max 50MB)',
     docNoTextLayer: 'PDF has no text layer. Cannot be translated.',
     docSheets: 'Sheets',
+    docPages: 'Pages',
+    docLineByLine: 'Line-by-line translation (for tables and lists)',
     docSelectAll: 'Select all',
     docDeselectAll: 'Deselect all',
     docTranslateBtn: 'Translate ({count} files, ~{chars} chars)',
@@ -99,6 +101,8 @@ const i18n = {
     docFileTooLarge: 'Файл слишком большой (макс. 50MB)',
     docNoTextLayer: 'В PDF отсутствует текстовый слой. Перевод невозможен.',
     docSheets: 'Листы',
+    docPages: 'Страницы',
+    docLineByLine: 'Построчный перевод (для таблиц и списков)',
     docSelectAll: 'Выбрать все',
     docDeselectAll: 'Снять все',
     docTranslateBtn: 'Перевести ({count} файлов, ~{chars} симв.)',
@@ -668,6 +672,14 @@ async function handleFiles(fileList) {
             entry.selectedSheets = result.metadata.sheets.map((s) => s.name);
           }
 
+          // For PDF: setup selected pages (all by default)
+          if (ext === 'pdf' && result.metadata.pageCount > 0) {
+            entry.selectedPages = Array.from(
+              { length: result.metadata.pageCount },
+              (_, i) => i + 1
+            );
+          }
+
           if (segments.length >= LARGE_SEGMENTS_WARNING_THRESHOLD) {
             entry.notice = t('docLargeFileWarning');
             showNotification(entry.notice, 'warning');
@@ -729,6 +741,134 @@ function toggleAllSheets(fileId, selectAll) {
   }
   renderFileList();
   updateTranslateButton();
+}
+
+function togglePage(fileId, pageNum) {
+  if (isTranslating) return;
+  const entry = uploadedFiles.find((f) => f.id === fileId);
+  if (!entry || !entry.selectedPages) return;
+
+  const idx = entry.selectedPages.indexOf(pageNum);
+  if (idx >= 0) {
+    entry.selectedPages.splice(idx, 1);
+  } else {
+    entry.selectedPages.push(pageNum);
+    entry.selectedPages.sort((a, b) => a - b);
+  }
+
+  // Update thumbnail UI without full re-render (preserve thumbnails)
+  const thumb = document.querySelector(`.page-thumb[data-file-id="${fileId}"][data-page="${pageNum}"]`);
+  if (thumb) {
+    thumb.classList.toggle('selected', idx < 0);
+  }
+  updatePagesHeader(fileId);
+  updateTranslateButton();
+}
+
+function toggleAllPages(fileId, selectAll) {
+  if (isTranslating) return;
+  const entry = uploadedFiles.find((f) => f.id === fileId);
+  if (!entry || !entry.parseResult) return;
+
+  if (selectAll) {
+    entry.selectedPages = Array.from(
+      { length: entry.parseResult.metadata.pageCount },
+      (_, i) => i + 1
+    );
+  } else {
+    entry.selectedPages = [];
+  }
+
+  // Update thumbnail UI without full re-render
+  const thumbs = document.querySelectorAll(`.page-thumb[data-file-id="${fileId}"]`);
+  thumbs.forEach((thumb) => {
+    const pageNum = Number(thumb.dataset.page);
+    thumb.classList.toggle('selected', selectAll || entry.selectedPages.includes(pageNum));
+  });
+  updatePagesHeader(fileId);
+  updateTranslateButton();
+}
+
+function updatePagesHeader(fileId) {
+  const entry = uploadedFiles.find((f) => f.id === fileId);
+  if (!entry) return;
+  const pageCount = entry.parseResult?.metadata?.pageCount || 0;
+  const selectedCount = entry.selectedPages?.length || 0;
+  const allSelected = selectedCount === pageCount;
+  const headerBtn = document.querySelector(`.pages-toggle-btn[data-file-id="${fileId}"]`);
+  if (headerBtn) {
+    headerBtn.textContent = allSelected ? t('docDeselectAll') : t('docSelectAll');
+  }
+  // Update the label with page count
+  const label = headerBtn?.parentElement?.querySelector('.pages-label');
+  if (label) {
+    label.textContent = t('docPages') + ' (' + selectedCount + '/' + pageCount + '):';
+  }
+}
+
+async function renderPageThumbnails(entry, container) {
+  const arrayBuffer = entry.parseResult?.metadata?.originalArrayBuffer;
+  if (!arrayBuffer || typeof pdfjsLib === 'undefined') return;
+
+  let pdf;
+  try {
+    pdf = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+  } catch (e) {
+    console.warn('Failed to load PDF for thumbnails:', e.message);
+    return;
+  }
+
+  const totalPages = pdf.numPages;
+  const BATCH_SIZE = 10;
+
+  async function renderBatch(startPage) {
+    const end = Math.min(startPage + BATCH_SIZE, totalPages + 1);
+    for (let i = startPage; i < end; i++) {
+      // Check if container is still in DOM (file might have been removed)
+      if (!container.isConnected) {
+        pdf.destroy();
+        return;
+      }
+
+      try {
+        const page = await pdf.getPage(i);
+        const origViewport = page.getViewport({ scale: 1 });
+        const scale = 110 / origViewport.height;
+        const viewport = page.getViewport({ scale });
+
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+        const thumb = document.createElement('div');
+        thumb.className = 'page-thumb' + (entry.selectedPages?.includes(i) ? ' selected' : '');
+        thumb.dataset.fileId = entry.id;
+        thumb.dataset.page = i;
+
+        thumb.appendChild(canvas);
+
+        const pageLabel = document.createElement('div');
+        pageLabel.className = 'page-num';
+        pageLabel.textContent = i;
+        thumb.appendChild(pageLabel);
+
+        thumb.addEventListener('click', () => togglePage(entry.id, i));
+
+        container.appendChild(thumb);
+      } catch (e) {
+        console.warn(`Failed to render thumbnail for page ${i}:`, e.message);
+      }
+    }
+
+    if (end <= totalPages) {
+      setTimeout(() => renderBatch(end), 0);
+    } else {
+      pdf.destroy();
+    }
+  }
+
+  renderBatch(1);
 }
 
 // ===== Render File List =====
@@ -893,6 +1033,62 @@ function renderFileList() {
       card.appendChild(sheetsSection);
     }
 
+    // PDF options section
+    if (ext === 'pdf' && entry.parseResult && entry.parseResult.metadata.pageCount > 0) {
+      const pagesSection = document.createElement('div');
+      pagesSection.className = 'pages-section';
+
+      const pageCount = entry.parseResult.metadata.pageCount;
+
+      // Page selection (only for multi-page PDFs)
+      if (pageCount > 1) {
+        const pagesHeader = document.createElement('div');
+        pagesHeader.className = 'pages-header';
+
+        const pagesLabel = document.createElement('span');
+        pagesLabel.className = 'pages-label';
+        pagesLabel.textContent = t('docPages') + ' (' + (entry.selectedPages?.length || 0) + '/' + pageCount + '):';
+
+        const allPagesSelected = entry.selectedPages && entry.selectedPages.length === pageCount;
+        const pagesToggleBtn = document.createElement('button');
+        pagesToggleBtn.className = 'pages-toggle-btn';
+        pagesToggleBtn.dataset.fileId = entry.id;
+        pagesToggleBtn.textContent = allPagesSelected ? t('docDeselectAll') : t('docSelectAll');
+        pagesToggleBtn.disabled = isTranslating;
+        pagesToggleBtn.addEventListener('click', () => toggleAllPages(entry.id, !allPagesSelected));
+
+        pagesHeader.appendChild(pagesLabel);
+        pagesHeader.appendChild(pagesToggleBtn);
+        pagesSection.appendChild(pagesHeader);
+
+        const pagesList = document.createElement('div');
+        pagesList.className = 'pages-list';
+        pagesSection.appendChild(pagesList);
+
+        // Render thumbnails asynchronously (don't block UI)
+        renderPageThumbnails(entry, pagesList);
+      }
+
+      // Line-by-line translation checkbox
+      const lineByLineLabel = document.createElement('label');
+      lineByLineLabel.className = 'pdf-option-checkbox';
+      const lineByLineCheckbox = document.createElement('input');
+      lineByLineCheckbox.type = 'checkbox';
+      lineByLineCheckbox.checked = !!entry.lineByLine;
+      lineByLineCheckbox.disabled = isTranslating;
+      lineByLineCheckbox.addEventListener('change', () => {
+        entry.lineByLine = lineByLineCheckbox.checked;
+        updateTranslateButton();
+      });
+      const lineByLineText = document.createElement('span');
+      lineByLineText.textContent = t('docLineByLine');
+      lineByLineLabel.appendChild(lineByLineCheckbox);
+      lineByLineLabel.appendChild(lineByLineText);
+      pagesSection.appendChild(lineByLineLabel);
+
+      card.appendChild(pagesSection);
+    }
+
     container.appendChild(card);
   }
 
@@ -939,6 +1135,9 @@ function getTranslatableFiles() {
     if ((ext === 'xlsx' || ext === 'xls') && Array.isArray(entry.selectedSheets)) {
       return entry.selectedSheets.length > 0;
     }
+    if (ext === 'pdf' && Array.isArray(entry.selectedPages)) {
+      return entry.selectedPages.length > 0;
+    }
     return true;
   });
 }
@@ -953,6 +1152,15 @@ function getTotalChars() {
       // Count only selected sheets
       for (const seg of entry.parseResult.segments) {
         if (entry.selectedSheets.includes(seg.meta.sheet)) {
+          total += seg.text.length;
+        }
+      }
+    } else if (ext === 'pdf' && entry.selectedPages &&
+               entry.selectedPages.length < (entry.parseResult.metadata.pageCount || 0)) {
+      // Count only selected pages
+      const allowedPages = new Set(entry.selectedPages);
+      for (const seg of entry.parseResult.segments) {
+        if (allowedPages.has(seg.meta?.page)) {
           total += seg.text.length;
         }
       }
@@ -1047,6 +1255,12 @@ async function startTranslation() {
     const ext = getFileExtension(entry.file.name);
     if ((ext === 'xlsx' || ext === 'xls') && Array.isArray(entry.selectedSheets)) {
       jobOptions.selectedSheets = entry.selectedSheets.slice();
+    }
+    if (ext === 'pdf' && Array.isArray(entry.selectedPages)) {
+      jobOptions.selectedPages = entry.selectedPages.slice();
+    }
+    if (ext === 'pdf' && entry.lineByLine) {
+      jobOptions.lineByLine = true;
     }
 
     const jobId = translationManager.addJob(entry.file, jobOptions);
@@ -1938,12 +2152,22 @@ function buildPDFFullPreview(entry) {
     pageMap.get(page).push(segment);
   }
 
-  const maxPageFromMetadata = Number(entry.translatedResult?.metadata?.pageCount || entry.parseResult?.metadata?.pageCount || 0);
-  const maxPageFromSegments = Math.max(...Array.from(pageMap.keys()));
-  const pageCount = Math.max(maxPageFromMetadata, maxPageFromSegments);
+  // Use selectedPages if available, otherwise all pages
+  const selectedPages = entry.translatedResult?.metadata?.selectedPages
+    || entry.selectedPages
+    || null;
+  let pageNumbers;
+  if (Array.isArray(selectedPages) && selectedPages.length > 0) {
+    pageNumbers = selectedPages.slice().sort((a, b) => a - b);
+  } else {
+    const maxPageFromMetadata = Number(entry.translatedResult?.metadata?.pageCount || entry.parseResult?.metadata?.pageCount || 0);
+    const maxPageFromSegments = pageMap.size ? Math.max(...Array.from(pageMap.keys())) : 0;
+    const pageCount = Math.max(maxPageFromMetadata, maxPageFromSegments, 1);
+    pageNumbers = Array.from({ length: pageCount }, (_, i) => i + 1);
+  }
 
   const pages = [];
-  for (let page = 1; page <= pageCount; page++) {
+  for (const page of pageNumbers) {
     const pageSegments = (pageMap.get(page) || []).slice().sort((a, b) => {
       return Number(a?.meta?.blockIndex || 0) - Number(b?.meta?.blockIndex || 0);
     });

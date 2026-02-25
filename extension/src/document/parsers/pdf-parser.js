@@ -131,24 +131,52 @@ function buildTextBlocks(items, viewport) {
   let blockIndex = 0;
   for (const line of lines) {
     const lineItems = line.items.slice().sort((a, b) => a.layout.x - b.layout.x);
-    const text = buildLineText(lineItems);
-    if (!text) continue;
 
-    const summary = summarizeLayouts(
-      lineItems.map((entry) => entry.layout),
-      viewport
-    );
-    summary.bbox.height = Math.max(summary.bbox.height, medianFontSize * 1.12);
+    // Split line into separate cell groups at large gaps (table column boundaries)
+    const cellGroups = splitLineAtColumnGaps(lineItems);
 
-    blocks.push({
-      text,
-      blockIndex: blockIndex++,
-      bbox: summary.bbox,
-      style: summary.style,
-    });
+    for (const group of cellGroups) {
+      const text = buildLineText(group);
+      if (!text) continue;
+
+      const summary = summarizeLayouts(
+        group.map((entry) => entry.layout),
+        viewport
+      );
+      summary.bbox.height = Math.max(summary.bbox.height, medianFontSize * 1.12);
+
+      blocks.push({
+        text,
+        blockIndex: blockIndex++,
+        bbox: summary.bbox,
+        style: summary.style,
+      });
+    }
   }
 
   return blocks;
+}
+
+function splitLineAtColumnGaps(sortedItems) {
+  if (sortedItems.length <= 1) return [sortedItems];
+
+  const groups = [[sortedItems[0]]];
+  for (let i = 1; i < sortedItems.length; i++) {
+    const prev = sortedItems[i - 1];
+    const curr = sortedItems[i];
+    const gap = curr.layout.x - (prev.layout.x + prev.layout.width);
+    const fontSize = Math.max(6, prev.layout.fontSize, curr.layout.fontSize);
+
+    // A gap wider than 2x font size indicates a column boundary
+    // (normal word gaps are < 1.4x fontSize per buildGapSeparator)
+    if (gap > fontSize * 2) {
+      groups.push([curr]);
+    } else {
+      groups[groups.length - 1].push(curr);
+    }
+  }
+
+  return groups;
 }
 
 function buildLineText(lineItems) {
@@ -674,6 +702,12 @@ function smartGroupBlocks(blocks) {
       if (fontDiff < 0.5 && xDiff < 5 && vGap >= 0 && vGap < prev.style.fontSize * 1.8) {
         paraBlocks.push(next);
         k++;
+        // Safeguard: if we've accumulated many single-line blocks,
+        // this is likely a table/list, not a paragraph — stop merging
+        if (paraBlocks.length >= 6) {
+          const allSingleLine = paraBlocks.every((b) => !b.text.includes('\n'));
+          if (allSingleLine) break;
+        }
       } else {
         break;
       }
@@ -702,7 +736,7 @@ function smartGroupBlocks(blocks) {
         classification: block.classification || 'body',
         tableInfo: block.tableInfo || null,
         skipTranslation: !!block.skipTranslation,
-        originalBlocks: block.originalBlocks || [{ bbox: { ...block.bbox }, style: { ...block.style } }],
+        originalBlocks: block.originalBlocks || [{ text: block.text, bbox: { ...block.bbox }, style: { ...block.style } }],
       },
     });
   }
@@ -727,7 +761,7 @@ function mergeBlockGroup(group) {
     pageHeight: group[0].pageHeight,
     classification: group[0].classification,
     skipTranslation: group[0].skipTranslation,
-    originalBlocks: group.map((b) => ({ bbox: { ...b.bbox }, style: { ...b.style } })),
+    originalBlocks: group.map((b) => ({ text: b.text, bbox: { ...b.bbox }, style: { ...b.style } })),
   };
 }
 
@@ -743,7 +777,7 @@ function mergeParagraphBlocks(paraBlocks) {
     if (b.originalBlocks) {
       allOriginals.push(...b.originalBlocks);
     } else {
-      allOriginals.push({ bbox: { ...b.bbox }, style: { ...b.style } });
+      allOriginals.push({ text: b.text, bbox: { ...b.bbox }, style: { ...b.style } });
     }
   }
 
@@ -810,7 +844,13 @@ function computeTextLayout(translatedText, segment, pageMeta, allPageSegments, r
   } catch (e) { /* font measurement can fail on special chars */ }
 
   // Step 2: Expand bbox right
-  const maxWidth = findAvailableWidth(origBbox, allPageSegments, pageMeta, segment);
+  let maxWidth = findAvailableWidth(origBbox, allPageSegments, pageMeta, segment);
+
+  // For table cells, limit width to the detected column width
+  const tableInfo = segment.meta?.tableInfo;
+  if (tableInfo && tableInfo.colWidth > 0) {
+    maxWidth = Math.min(maxWidth, tableInfo.colWidth - 4);
+  }
 
   try {
     const directWidth = activeFont.widthOfTextAtSize(translatedText, fontSize);
@@ -1000,6 +1040,39 @@ async function fetchFontBytes(relativePath) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+/**
+ * Split merged segments back into individual lines using originalBlocks data.
+ * Used when "line-by-line translation" option is enabled.
+ */
+function splitSegmentsIntoLines(segments) {
+  const result = [];
+  let idx = 0;
+
+  for (const segment of segments) {
+    const blocks = segment.meta?.originalBlocks;
+    if (!blocks || blocks.length <= 1 || !blocks[0]?.text) {
+      result.push({ ...segment, index: idx++ });
+      continue;
+    }
+
+    for (const block of blocks) {
+      result.push({
+        text: block.text,
+        index: idx++,
+        meta: {
+          ...segment.meta,
+          bbox: { ...block.bbox },
+          style: { ...block.style },
+          originalBlocks: [{ text: block.text, bbox: { ...block.bbox }, style: { ...block.style } }],
+          splitFromIndex: segment.index,
+        },
+      });
+    }
+  }
+
+  return result;
+}
+
 async function assemblePDF(originalArrayBuffer, translatedSegments, metadata) {
   if (!(originalArrayBuffer instanceof ArrayBuffer)) {
     throw new Error('Original PDF data is missing.');
@@ -1031,8 +1104,14 @@ async function assemblePDF(originalArrayBuffer, translatedSegments, metadata) {
 
   const segmentsByPage = groupSegmentsByPage(translatedSegments);
   const pages = pdfDoc.getPages();
+  const selectedPages = Array.isArray(metadata?.selectedPages)
+    ? new Set(metadata.selectedPages)
+    : null;
 
   for (let pageNum = 1; pageNum <= pages.length; pageNum++) {
+    // Skip unselected pages (they'll be removed later)
+    if (selectedPages && !selectedPages.has(pageNum)) continue;
+
     const page = pages[pageNum - 1];
     const { width: pageWidth, height: pageHeight } = page.getSize();
     const pageSegments = segmentsByPage.get(pageNum) || [];
@@ -1137,6 +1216,15 @@ async function assemblePDF(originalArrayBuffer, translatedSegments, metadata) {
     }
   }
 
+  // Remove unselected pages from the final PDF (iterate in reverse to preserve indices)
+  if (selectedPages) {
+    for (let i = pages.length - 1; i >= 0; i--) {
+      if (!selectedPages.has(i + 1)) {
+        pdfDoc.removePage(i);
+      }
+    }
+  }
+
   const pdfBytes = await pdfDoc.save();
   return new Blob([pdfBytes], { type: 'application/pdf' });
 }
@@ -1183,6 +1271,14 @@ function sanitizeXmlChars(value) {
   return String(value || '').replace(/[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD]/g, '');
 }
 
+function getOutputPageNumbers(segmentsByPage, metadata) {
+  if (Array.isArray(metadata?.selectedPages) && metadata.selectedPages.length > 0) {
+    return metadata.selectedPages.slice().sort((a, b) => a - b);
+  }
+  const pageCount = resolvePdfPageCount(segmentsByPage, metadata);
+  return Array.from({ length: pageCount }, (_, i) => i + 1);
+}
+
 function resolvePdfPageCount(segmentsByPage, metadata) {
   const pageIndexes = Array.from(segmentsByPage.keys()).map((value) => Number(value) || 0);
   const maxSegmentPage = pageIndexes.length ? Math.max(...pageIndexes) : 0;
@@ -1213,10 +1309,10 @@ function stripFileExtension(fileName) {
  */
 function buildTranslatedText(translatedSegments, metadata) {
   const segmentsByPage = groupSegmentsByPage(translatedSegments);
-  const pageCount = resolvePdfPageCount(segmentsByPage, metadata);
+  const pageNumbers = getOutputPageNumbers(segmentsByPage, metadata);
   const lines = [];
 
-  for (let page = 1; page <= pageCount; page++) {
+  for (const page of pageNumbers) {
     lines.push(`--- Page ${page} ---`);
     const pageSegments = segmentsByPage.get(page) || [];
     for (const segment of pageSegments) {
@@ -1236,10 +1332,10 @@ function buildTranslatedText(translatedSegments, metadata) {
  */
 function buildTranslatedHTML(translatedSegments, metadata) {
   const segmentsByPage = groupSegmentsByPage(translatedSegments);
-  const pageCount = resolvePdfPageCount(segmentsByPage, metadata);
+  const pageNumbers = getOutputPageNumbers(segmentsByPage, metadata);
   let html = '';
 
-  for (let page = 1; page <= pageCount; page++) {
+  for (const page of pageNumbers) {
     html += `<div class="pdf-page"><h3>Page ${page}</h3>`;
     const pageSegments = segmentsByPage.get(page) || [];
     for (const segment of pageSegments) {
