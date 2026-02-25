@@ -721,12 +721,29 @@
 
   // ===== Document Import From Chat =====
 
+  let _menuInjectionTimer = null;
+
+  function scheduleMenuInjectionRetries() {
+    if (_menuInjectionTimer) clearTimeout(_menuInjectionTimer);
+    let attempts = 0;
+    const maxAttempts = 6;
+    const tryInject = () => {
+      _menuInjectionTimer = null;
+      if (injectDocumentMenuItemIntoOpenMenus()) return;
+      attempts++;
+      if (attempts < maxAttempts) {
+        _menuInjectionTimer = setTimeout(tryInject, 80);
+      }
+    };
+    tryInject();
+  }
+
   function startDocumentContextMenuIntegration() {
     if (documentMenuObserver) return;
 
     const captureCandidate = (event) => {
       captureDocumentMenuCandidateFromEvent(event);
-      injectDocumentMenuItemIntoOpenMenus();
+      scheduleMenuInjectionRetries();
     };
 
     document.addEventListener('contextmenu', captureCandidate, true);
@@ -734,7 +751,7 @@
     document.addEventListener('click', captureCandidate, true);
 
     documentMenuObserver = new MutationObserver(() => {
-      injectDocumentMenuItemIntoOpenMenus();
+      scheduleMenuInjectionRetries();
     });
     documentMenuObserver.observe(document.body, { childList: true, subtree: true });
   }
@@ -749,7 +766,11 @@
     };
 
     const documentInfo = extractDocumentInfoFromRow(row, { requireUrl: false });
-    if (!documentInfo) return;
+    if (!documentInfo) {
+      // Clicked on a non-document message — clear stale document candidate
+      lastDocumentMenuCandidate = null;
+      return;
+    }
 
     lastDocumentMenuCandidate = {
       row,
@@ -1039,13 +1060,21 @@
 
   function injectDocumentMenuItemIntoOpenMenus() {
     const candidate = getActiveDocumentMenuCandidate();
-    if (!candidate) return;
+    if (!candidate) return false;
 
     const targets = getContextMenuInsertionTargets();
+    if (targets.length === 0) return false;
+
+    let injected = false;
     for (const target of targets) {
-      if (target.container.querySelector('.wt-doc-menu-item')) continue;
+      if (target.container.querySelector('.wt-doc-menu-item')) {
+        injected = true;
+        continue;
+      }
       appendDocumentMenuItem(target.container, candidate, target.actionNode);
+      injected = true;
     }
+    return injected;
   }
 
   function createDocumentMenuItemTemplate(templateNode) {
@@ -1055,10 +1084,16 @@
 
     item.classList.add('wt-doc-menu-item');
     item.removeAttribute?.('aria-disabled');
+    item.removeAttribute?.('aria-selected');
     item.removeAttribute?.('data-animate-dropdown-item');
     item.removeAttribute?.('id');
     item.setAttribute?.('role', 'button');
     item.tabIndex = 0;
+
+    // Force active appearance — override any inherited disabled/inactive styles
+    item.style.opacity = '1';
+    item.style.pointerEvents = 'auto';
+    item.style.cursor = 'pointer';
 
     const label = wt('translateDocument');
     const labelNode = Array.from(item.querySelectorAll('span, div')).find((node) => {
@@ -1069,9 +1104,16 @@
 
     if (labelNode) {
       labelNode.textContent = label;
+      labelNode.style.color = 'inherit';
+      labelNode.style.opacity = '1';
     } else {
       item.textContent = label;
     }
+
+    // Also reset color/opacity on all child elements
+    item.querySelectorAll('*').forEach((child) => {
+      child.style.opacity = '1';
+    });
 
     return item;
   }
@@ -1281,6 +1323,16 @@
     const observedBefore = new Set(getObservedBlobCandidates().map((item) => item.url));
     const preferredExtension = String(hint?.extension || '').toLowerCase();
 
+    // Set intercept flag before clicking — prevents actual file download
+    try {
+      window.postMessage({
+        __wtBlobObserver: true,
+        type: 'set-intercept-download',
+      }, '*');
+    } catch {}
+
+    await waitMs(30);
+
     try {
       button.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
     } catch {}
@@ -1296,7 +1348,7 @@
     const observedBlob = await waitForObservedBlobUrl({
       seenUrls: observedBefore,
       preferredExtension,
-      timeoutMs: 2200,
+      timeoutMs: 3500,
     });
     if (observedBlob) return observedBlob;
 
@@ -1458,17 +1510,35 @@
     window.addEventListener('message', (event) => {
       if (event.source !== window) return;
       const data = event.data;
-      if (!data || data.__wtBlobObserver !== true || data.type !== 'blob-created') return;
+      if (!data || data.__wtBlobObserver !== true) return;
 
-      const url = String(data.url || '');
-      if (!url.startsWith('blob:')) return;
+      if (data.type === 'blob-created') {
+        const url = String(data.url || '');
+        if (!url.startsWith('blob:')) return;
 
-      rememberObservedBlob({
-        url,
-        type: String(data.mimeType || ''),
-        size: Number(data.size || 0),
-        ts: Number(data.ts || Date.now()),
-      });
+        rememberObservedBlob({
+          url,
+          type: String(data.mimeType || ''),
+          size: Number(data.size || 0),
+          ts: Number(data.ts || Date.now()),
+        });
+        return;
+      }
+
+      if (data.type === 'download-intercepted') {
+        const url = String(data.url || '');
+        if (!url.startsWith('blob:')) return;
+
+        rememberObservedBlob({
+          url,
+          type: '',
+          size: 0,
+          ts: Date.now(),
+          intercepted: true,
+          fileName: String(data.fileName || ''),
+        });
+        return;
+      }
     }, true);
 
     const scriptId = 'wt-blob-observer-page-script';
@@ -1506,6 +1576,8 @@
         type: String(record.type || ''),
         size: Number(record.size || 0),
         ts: Number(record.ts || Date.now()),
+        intercepted: !!record.intercepted,
+        fileName: String(record.fileName || ''),
       });
     }
 
@@ -1532,6 +1604,22 @@
     const seenUrls = options.seenUrls || new Set();
     const preferredExtension = String(options.preferredExtension || '').toLowerCase();
 
+    // First pass: prefer intercepted blobs (most reliable — captured from download action)
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const item = candidates[i];
+      if (!item?.url || seenUrls.has(item.url)) continue;
+      if (!item.url.startsWith('blob:')) continue;
+      if (!item.intercepted) continue;
+
+      if (preferredExtension && item.fileName) {
+        const extFromName = getExtensionFromName(item.fileName);
+        if (extFromName && extFromName !== preferredExtension) continue;
+      }
+
+      return item.url;
+    }
+
+    // Second pass: any matching blob
     for (let i = candidates.length - 1; i >= 0; i--) {
       const item = candidates[i];
       if (!item?.url || seenUrls.has(item.url)) continue;
@@ -1540,6 +1628,11 @@
       if (preferredExtension) {
         const extFromType = getExtensionFromMimeType(item.type);
         if (extFromType && extFromType !== preferredExtension) continue;
+
+        if (item.fileName) {
+          const extFromName = getExtensionFromName(item.fileName);
+          if (extFromName && extFromName !== preferredExtension) continue;
+        }
       }
 
       return item.url;
